@@ -1,1 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environment variables
 .env
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Logs and debugging
+*.log
+*.pot
+*.pyc
+
+# Docker
+*.pid
+docker-compose.override.yml
+*.tar
+*.bak
+
+# VSCode
+.vscode/
+
+# Mac/Linux/Windows system files
+.DS_Store
+Thumbs.db
+
+# Pip
+pip-log.txt
+
+# PyInstaller
+dist/
+build/
+
+# Coverage/test files
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+.pytest_cache/
+.cache/
+.junit.xml
