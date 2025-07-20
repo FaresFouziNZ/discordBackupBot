@@ -23,3 +23,36 @@ services:
     depends_on:
       - kafka
     restart: always
+
+  hadoop-namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    environment:
+      - CLUSTER_NAME=test-hadoop
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    ports:
+      - "9870:9870"  # HDFS Web UI
+      - "8020:8020"  # HDFS FS port
+    networks:
+      - kafka-net
+
+  hadoop-datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    environment:
+      - CLUSTER_NAME=test-hadoop
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    depends_on:
+      - hadoop-namenode
+    networks:
+      - kafka-net
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+
+networks:
+  kafka-net:
