@@ -25,4 +25,5 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 
 # Run the bot
-CMD ["python", "bot.py"]
+CMD ["watchmedo", "auto-restart", "--patterns=*.py", "--recursive", "--", "python", "bot.py"]
+
