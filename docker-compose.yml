@@ -20,6 +20,8 @@ services:
   discord-bot:
     build: .
     env_file: .env
+    volumes:
+      - ./bot:/app/bot
     depends_on:
       - kafka
     restart: always

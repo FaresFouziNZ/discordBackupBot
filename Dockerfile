@@ -16,14 +16,17 @@ RUN apt-get update && apt-get install -y \
 
 
 # Copy files
-COPY requirements.txt .
+COPY bot/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY bot/ .
+
+# Match schedule used for reminders (lives at the repo root)
+COPY worldcup.json .
 
 # Set environment
 ENV PYTHONUNBUFFERED=1
 
 # Run the bot
-CMD ["watchmedo", "auto-restart", "--patterns=*.py", "--recursive", "--", "python", "bot.py"]
+CMD ["python", "bot.py"]
 
