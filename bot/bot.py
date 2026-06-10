@@ -1,18 +1,14 @@
 import discord
 from discord.ext import tasks
-from kafka import KafkaProducer
 import json
 import os
 import re
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-KAFKA_BROKER = os.getenv('KAFKA_BROKER', 'localhost:9092')
-KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'discord-topic')
 
 # Match reminder configuration
 WORLDCUP_FILE = os.getenv('WORLDCUP_FILE', 'worldcup.json')
@@ -46,12 +42,6 @@ intents.messages = True
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# Kafka producer setup
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_BROKER,
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
-)
-
 @client.event
 async def on_ready():
     global MATCHES
@@ -67,9 +57,7 @@ async def on_message(message):
         return
     if not message.content.startswith('^'):
         return
-    if message.content.startswith('^backup'):
-        await backup_channel_history(message.channel)
-    elif message.content.startswith('^next'):
+    if message.content.startswith('^next'):
         await send_upcoming(message.channel, limit=1)
         return
     elif message.content.startswith('^matches'):
@@ -110,85 +98,6 @@ async def on_message(message):
     elif message.content.startswith('^help'):
         await send_help(message.channel)
         return
-    print(f'Received message: {message.content}')
-    send_message_to_kafka(message)
-
-def send_message_to_kafka(message):
-    data = get_message_data(message)
-    producer.send(KAFKA_TOPIC, value=data)
-    print(f'Sent to Kafka: {data}')
-
-async def backup_channel_history(channel):
-    async for msg in channel.history(limit=10, oldest_first=True):
-        send_message_to_kafka(msg)
-
-def get_message_data(message):
-    attributes = [
-    'application', 
-    'application_id', 
-    'attachments', 
-    'channel_mentions', 
-    'clean_content', 
-    'components', 
-    'content', 
-    'embeds', 
-    'id', 
-    'interaction', 
-    'jump_url', 
-    'mention_everyone', 
-    'mentions', 
-    'nonce', 
-    'pinned', 
-    'position', 
-    'raw_channel_mentions', 
-    'raw_mentions', 
-    'raw_role_mentions', 
-    'reactions', 
-    'reference', 
-    'role_mentions', 
-    'role_subscription', 
-    'stickers', 
-    'system_content', 
-    'tts', 
-    'webhook_id']
-    
-    x = {attr: getattr(message, attr, None) for attr in attributes}
-    x['author'] = get_author_data(message.author)
-    x['channel'] = get_channel_data(message.channel)
-    x['guild'] = get_guild_data(message.guild)
-    x['created_at'] = message.created_at.isoformat()
-    x['edited_at'] = message.edited_at.isoformat() if message.edited_at else None
-
-    print(f'message data: {x}')
-    return x
-
-def get_author_data(author):
-    return {
-        'id': author.id if hasattr(author, 'id') else None,
-        'name': author.name if hasattr(author, 'name') else None,
-        'global_name': author.global_name if hasattr(author, 'global_name') else None,
-        'bot': author.bot if hasattr(author, 'bot') else None,
-        'nick': author.nick if hasattr(author, 'nick') else None
-    }
-
-def get_channel_data(channel):
-    return {
-        'id': channel.id if hasattr(channel, 'id') else None,
-        'name': channel.name if hasattr(channel, 'name') else None,
-        'position': channel.position if hasattr(channel, 'position') else None,
-        'nsfw': channel.nsfw if hasattr(channel, 'nsfw') else None,
-        'news': channel.news if hasattr(channel, 'news') else None,
-        'category_id': channel.category_id if hasattr(channel, 'category_id') else None
-    }
-
-def get_guild_data(guild):
-    return {
-        'id': guild.id if hasattr(guild, 'id') else None,
-        'name': guild.name if hasattr(guild, 'name') else None,
-        'shard_id': guild.shard_id if hasattr(guild, 'shard_id') else None,
-        'chunked': guild.chunked if hasattr(guild, 'chunked') else None,
-        'member_count': guild.member_count if hasattr(guild, 'member_count') else None
-    }
 
 # ---------------------------------------------------------------------------
 # World Cup match reminders
@@ -1048,8 +957,7 @@ async def send_help(channel):
         "`^leaderboard` — prediction standings (alias `^lb`)\n"
         f"_Points: {POINTS_EXACT} exact · {POINTS_GD} right result+GD · {POINTS_RESULT} right result_\n"
         "**Admin**\n"
-        "`^result <id> <s1> <s2> [pen:1|2]` — record a result (admins only)\n"
-        "`^backup` — back up channel history")
+        "`^result <id> <s1> <s2> [pen:1|2]` — record a result (admins only)")
 
 
 client.run(DISCORD_TOKEN)

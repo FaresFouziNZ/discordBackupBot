@@ -1,8 +1,8 @@
 # Discord World Cup Bot
 
-A Discord bot that backs up channel history to Kafka **and** runs a full
-World Cup 2026 companion: kickoff reminders, live schedules, group standings,
-result tracking, and an auto-resolving knockout bracket.
+A Discord bot and full World Cup 2026 companion: kickoff reminders, live
+schedules, group standings, result tracking, an auto-resolving knockout bracket,
+and a prediction sweepstake.
 
 All bot commands use the `^` prefix. Type `^help` in any channel to see them.
 
@@ -19,8 +19,6 @@ All bot commands use the `^` prefix. Type `^help` in any channel to see them.
    # Optional overrides:
    # REMINDER_CHANNEL=general            # reminders channel by name (default)
    # REMINDER_CHANNEL_ID=123456789012345678  # OR target one channel by ID (takes precedence)
-   # KAFKA_BROKER=kafka:9092
-   # KAFKA_TOPIC=discord-topic
    ```
 
 2. **Run it.**
@@ -63,22 +61,21 @@ that reminder is skipped rather than fired late.
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `^help` | List all commands |
-| `^next` | Show the next upcoming match |
-| `^matches [n]` | Show the next *n* matches (default 5), e.g. `^matches 10` |
-| `^team <name\|flag>` | All matches for a team, e.g. `^team Brazil` or `^team 🇧🇷` |
-| `^status` | Group progress overview (one line per group) |
-| `^group [letters]` | Fixtures **and** standings per group — all, or e.g. `^group A` |
-| `^standings [group]` | Group tables only — all groups, or one, e.g. `^standings A` |
-| `^qualified` | Group winners, runners-up, and best third-placed teams |
-| `^bracket` | Knockout bracket with resolved teams and scores |
-| `^predict <id> <home> <away>` | Predict a scoreline before kickoff, e.g. `^predict 1 2 1` |
-| `^predictions [id]` | Your predictions & points, or everyone's for a match (after kickoff) |
-| `^leaderboard` | Prediction standings (alias `^lb`) |
-| `^result <id> <s1> <s2> [pen:1\|2]` | Record a match result (**admins only**) |
-| `^backup` | Back up recent channel history to Kafka |
+| Command                             | What it does                                                         |
+| ----------------------------------- | -------------------------------------------------------------------- |
+| `^help`                             | List all commands                                                    |
+| `^next`                             | Show the next upcoming match                                         |
+| `^matches [n]`                      | Show the next _n_ matches (default 5), e.g. `^matches 10`            |
+| `^team <name\|flag>`                | All matches for a team, e.g. `^team Brazil` or `^team 🇧🇷`            |
+| `^status`                           | Group progress overview (one line per group)                         |
+| `^group [letters]`                  | Fixtures **and** standings per group — all, or e.g. `^group A`       |
+| `^standings [group]`                | Group tables only — all groups, or one, e.g. `^standings A`          |
+| `^qualified`                        | Group winners, runners-up, and best third-placed teams               |
+| `^bracket`                          | Knockout bracket with resolved teams and scores                      |
+| `^predict <id> <home> <away>`       | Predict a scoreline before kickoff, e.g. `^predict 1 2 1`            |
+| `^predictions [id]`                 | Your predictions & points, or everyone's for a match (after kickoff) |
+| `^leaderboard`                      | Prediction standings (alias `^lb`)                                   |
+| `^result <id> <s1> <s2> [pen:1\|2]` | Record a match result (**admins only**)                              |
 
 Every match in the listings is shown with an **id** (`#12`) — that's what you
 pass to `^result`.
@@ -178,12 +175,12 @@ you can fix a mistake by sending the corrected `^result` again.
 `worldcup.json` defines knockout slots with placeholders that the bot resolves
 automatically as results come in:
 
-| Placeholder | Resolves to |
-|---|---|
-| `1A` / `2A` | Winner / runner-up of Group A |
+| Placeholder  | Resolves to                                              |
+| ------------ | -------------------------------------------------------- |
+| `1A` / `2A`  | Winner / runner-up of Group A                            |
 | `3A/B/C/D/F` | One of the 8 best third-placed teams (from those groups) |
-| `W74` | Winner of match #74 |
-| `L101` | Loser of match #101 |
+| `W74`        | Winner of match #74                                      |
+| `L101`       | Loser of match #101                                      |
 
 - Group positions are finalized once **all six** matches in that group have
   results.
@@ -212,12 +209,12 @@ whole tournament — the player with the most points by the final wins.
 
 **Scoring** (applied automatically when a result is recorded):
 
-| Outcome of your prediction | Points |
-|---|---|
-| Exact scoreline | **5** |
-| Correct result **and** winning margin (non-draws) | **3** |
-| Correct result only (right winner, or a draw) | **2** |
-| Wrong result | 0 |
+| Outcome of your prediction                        | Points |
+| ------------------------------------------------- | ------ |
+| Exact scoreline                                   | **5**  |
+| Correct result **and** winning margin (non-draws) | **3**  |
+| Correct result only (right winner, or a draw)     | **2**  |
+| Wrong result                                      | 0      |
 
 **See predictions & standings:**
 
@@ -234,12 +231,12 @@ shouts out anyone who nailed the exact score.
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `worldcup.json` | The match schedule (dates, times, teams, venues) |
-| `bot/results.json` | Recorded match results (created on first `^result`) |
-| `bot/predictions.json` | Everyone's match predictions (created on first `^predict`) |
-| `bot/reminder_state.json` | Which reminders have already been sent |
+| File                      | Purpose                                                    |
+| ------------------------- | ---------------------------------------------------------- |
+| `worldcup.json`           | The match schedule (dates, times, teams, venues)           |
+| `bot/results.json`        | Recorded match results (created on first `^result`)        |
+| `bot/predictions.json`    | Everyone's match predictions (created on first `^predict`) |
+| `bot/reminder_state.json` | Which reminders have already been sent                     |
 
 ---
 
@@ -248,7 +245,7 @@ shouts out anyone who nailed the exact score.
 - **Standings tiebreakers** use points → goal difference → goals scored → name.
   FIFA's full criteria also include head-to-head and fair-play points, which are
   not modeled.
-- **Best third-placed assignment** produces a *valid* mapping (each third-placed
+- **Best third-placed assignment** produces a _valid_ mapping (each third-placed
   team lands in a slot allowed for its group). In rare combinations this may
   differ from FIFA's specific published table while remaining a legal pairing.
 - The `^standings` table omits flags on purpose so its columns stay aligned in
@@ -258,12 +255,10 @@ shouts out anyone who nailed the exact score.
 
 ## Environment variables
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `DISCORD_TOKEN` | — | Bot token (required) |
-| `RESULT_ADMIN_IDS` | *(empty)* | Comma-separated Discord user IDs allowed to record results |
-| `REMINDER_CHANNEL` | `general` | Reminders channel **by name** (posts to every matching channel) |
-| `REMINDER_CHANNEL_ID` | *(unset)* | Reminders channel **by ID** — takes precedence over the name when set |
-| `WORLDCUP_FILE` | `worldcup.json` | Path to the schedule file |
-| `KAFKA_BROKER` | `localhost:9092` | Kafka bootstrap server |
-| `KAFKA_TOPIC` | `discord-topic` | Kafka topic for backups |
+| Variable              | Default         | Purpose                                                               |
+| --------------------- | --------------- | --------------------------------------------------------------------- |
+| `DISCORD_TOKEN`       | —               | Bot token (required)                                                  |
+| `RESULT_ADMIN_IDS`    | _(empty)_       | Comma-separated Discord user IDs allowed to record results            |
+| `REMINDER_CHANNEL`    | `general`       | Reminders channel **by name** (posts to every matching channel)       |
+| `REMINDER_CHANNEL_ID` | _(unset)_       | Reminders channel **by ID** — takes precedence over the name when set |
+| `WORLDCUP_FILE`       | `worldcup.json` | Path to the schedule file                                             |
