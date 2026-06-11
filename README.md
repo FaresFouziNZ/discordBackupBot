@@ -4,7 +4,9 @@ A Discord bot and full World Cup 2026 companion: kickoff reminders, live
 schedules, group standings, result tracking, an auto-resolving knockout bracket,
 and a prediction sweepstake.
 
-All bot commands use the `^` prefix. Type `^help` in any channel to see them.
+Every command is available **two ways** — as a Discord slash command (`/next`,
+`/predict …`, with typed, named parameters) **or** as a text command with the
+`^` prefix (`^next`, `^predict …`). Type `/help` or `^help` to see them all.
 
 ---
 
@@ -17,8 +19,11 @@ All bot commands use the `^` prefix. Type `^help` in any channel to see them.
    DISCORD_TOKEN=your-bot-token
    RESULT_ADMIN_IDS=123456789012345678   # Discord user IDs allowed to enter results
    # Optional overrides:
+   # GUILD_ID=123456789012345678         # sync slash commands to one server instantly
    # REMINDER_CHANNEL=general            # reminders channel by name (default)
    # REMINDER_CHANNEL_ID=123456789012345678  # OR target one channel by ID (takes precedence)
+   # REMINDER_ROLE_ID=123456789012345678     # role pinged in the 15-minute reminder
+   # VOICE_CHANNEL_ID=123456789012345678     # voice channel whose status shows the live match
    ```
 
 2. **Run it.**
@@ -27,11 +32,15 @@ All bot commands use the `^` prefix. Type `^help` in any channel to see them.
    docker compose up --build
    ```
 
-3. **Invite the bot** to your server and make sure it can **View Channel** and
-   **Send Messages** in your reminders channel (default `#general`).
+3. **Invite the bot** with both the `bot` and `applications.commands` scopes
+   (the latter is required for slash commands), and make sure it can **View
+   Channel** and **Send Messages** in your reminders channel (default `#general`).
 
-> The bot needs the **Message Content Intent** enabled in the Discord Developer
-> Portal (it reads `^` commands from messages).
+> - Enable the **Message Content Intent** in the Discord Developer Portal (needed
+>   for the `^` text commands).
+> - Slash commands appear after the bot syncs them on startup. A **global** sync
+>   can take up to an hour the first time; set `GUILD_ID` to sync to one server
+>   instantly while testing.
 
 ### Finding your Discord user ID
 
@@ -52,6 +61,11 @@ reminders channel:
 Each reminder shows the teams (with flags), the kickoff time, and a live
 countdown. Times use Discord's native timestamp format, so **every user sees
 the time in their own local timezone** — no manual conversion needed.
+
+- The **15-minute reminder** also pings `REMINDER_ROLE_ID`, if set.
+- At **kickoff**, if `VOICE_CHANNEL_ID` is set, the bot sets that voice channel's
+  status to the match title (e.g. `🇲🇽 Mexico vs 🇿🇦 South Africa`). Requires
+  discord.py ≥ 2.4 and the **Set Voice Channel Status** permission.
 
 Reminders are de-duplicated and survive restarts (tracked in
 `bot/reminder_state.json`). If the bot is offline through a reminder window,
@@ -259,6 +273,9 @@ shouts out anyone who nailed the exact score.
 | --------------------- | --------------- | --------------------------------------------------------------------- |
 | `DISCORD_TOKEN`       | —               | Bot token (required)                                                  |
 | `RESULT_ADMIN_IDS`    | _(empty)_       | Comma-separated Discord user IDs allowed to record results            |
+| `GUILD_ID`            | _(unset)_       | Sync slash commands to this one server instantly (else global sync)   |
 | `REMINDER_CHANNEL`    | `general`       | Reminders channel **by name** (posts to every matching channel)       |
 | `REMINDER_CHANNEL_ID` | _(unset)_       | Reminders channel **by ID** — takes precedence over the name when set |
+| `REMINDER_ROLE_ID`    | _(unset)_       | Role mentioned in the 15-minute reminder                              |
+| `VOICE_CHANNEL_ID`    | _(unset)_       | Voice channel whose status is set to the match title at kickoff       |
 | `WORLDCUP_FILE`       | `worldcup.json` | Path to the schedule file                                             |

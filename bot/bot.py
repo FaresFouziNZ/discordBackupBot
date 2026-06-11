@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import tasks
 import json
 import os
@@ -15,6 +16,10 @@ WORLDCUP_FILE = os.getenv('WORLDCUP_FILE', 'worldcup.json')
 REMINDER_CHANNEL = os.getenv('REMINDER_CHANNEL', 'general')   # channel name (fallback)
 # Optional: target a specific channel by ID; takes precedence over the name above.
 REMINDER_CHANNEL_ID = int(os.getenv('REMINDER_CHANNEL_ID')) if os.getenv('REMINDER_CHANNEL_ID', '').strip().isdigit() else None
+# Optional: role pinged in the 15-minute reminder, and a voice channel whose
+# status is set to the match title at kickoff.
+REMINDER_ROLE_ID = int(os.getenv('REMINDER_ROLE_ID')) if os.getenv('REMINDER_ROLE_ID', '').strip().isdigit() else None
+VOICE_CHANNEL_ID = int(os.getenv('VOICE_CHANNEL_ID')) if os.getenv('VOICE_CHANNEL_ID', '').strip().isdigit() else None
 REMINDER_LEAD_MINUTES = [60, 15]                 # remind 1 hour and 15 minutes before
 REMINDER_GRACE = timedelta(minutes=10)           # max lateness before a reminder is skipped
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reminder_state.json')
@@ -39,8 +44,32 @@ GROUPS = {}            # group letter -> list of group-stage match_dicts
 # Discord client setup
 intents = discord.Intents.default()
 intents.messages = True
-intents.message_content = True
+intents.message_content = True          # required for the `^` text commands
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)  # `/` slash commands
+
+# Optional: sync slash commands to a single guild for instant availability
+# (a global sync can take up to an hour to appear). Set GUILD_ID to enable.
+GUILD_ID = int(os.getenv('GUILD_ID')) if os.getenv('GUILD_ID', '').strip().isdigit() else None
+
+
+class Responder:
+    """Lets the same handlers reply to either a slash interaction or a channel.
+    Exposes .send() like a channel; for an interaction it uses the initial
+    response first, then follow-up messages."""
+
+    def __init__(self, interaction, ephemeral=False):
+        self.interaction = interaction
+        self.ephemeral = ephemeral
+        self._responded = False
+
+    async def send(self, content):
+        if not self._responded:
+            await self.interaction.response.send_message(content, ephemeral=self.ephemeral)
+            self._responded = True
+        else:
+            await self.interaction.followup.send(content, ephemeral=self.ephemeral)
+
 
 @client.event
 async def on_ready():
@@ -48,6 +77,16 @@ async def on_ready():
     print(f'Bot connected as {client.user}')
     MATCHES = load_matches()
     print(f'Loaded {len(MATCHES)} matches for reminders')
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            tree.copy_global_to(guild=guild)
+            synced = await tree.sync(guild=guild)
+        else:
+            synced = await tree.sync()
+        print(f'Synced {len(synced)} slash commands')
+    except Exception as e:
+        print(f'Slash command sync failed: {e}')
     if not check_reminders.is_running():
         check_reminders.start()
 
@@ -66,7 +105,7 @@ async def on_message(message):
         await send_upcoming(message.channel, limit=limit)
         return
     elif message.content.startswith('^result'):
-        await handle_result_command(message)
+        await result_text_command(message)
         return
     elif message.content.startswith('^standings'):
         await send_standings(message.channel, message.content.split()[1:])
@@ -87,10 +126,10 @@ async def on_message(message):
         await send_bracket(message.channel)
         return
     elif message.content.startswith('^predictions'):   # must precede ^predict
-        await send_predictions(message, message.content.split()[1:])
+        await predictions_text_command(message)
         return
     elif message.content.startswith('^predict'):
-        await handle_predict(message)
+        await predict_text_command(message)
         return
     elif message.content.startswith('^leaderboard') or message.content.startswith('^lb'):
         await send_leaderboard(message.channel)
@@ -98,6 +137,132 @@ async def on_message(message):
     elif message.content.startswith('^help'):
         await send_help(message.channel)
         return
+
+
+# ---------------------------------------------------------------------------
+# `^` text-command wrappers: parse arguments, then call the shared do_* logic.
+# ---------------------------------------------------------------------------
+
+async def predict_text_command(message):
+    parts = message.content.split()
+    if len(parts) < 4:
+        await message.channel.send("Usage: `^predict <id> <home> <away>` — e.g. `^predict 1 2 1`")
+        return
+    try:
+        mid, s1, s2 = int(parts[1]), int(parts[2]), int(parts[3])
+    except ValueError:
+        await message.channel.send("⚠️ Id and scores must be whole numbers.")
+        return
+    await do_predict(message.author, message.channel, mid, s1, s2)
+
+
+async def result_text_command(message):
+    parts = message.content.split()
+    if len(parts) < 4:
+        await message.channel.send(
+            "Usage: `^result <id> <home> <away> [pen:1|2]` — e.g. `^result 1 2 1`")
+        return
+    try:
+        mid, s1, s2 = int(parts[1]), int(parts[2]), int(parts[3])
+    except ValueError:
+        await message.channel.send("⚠️ Id and scores must be whole numbers.")
+        return
+    pen = None
+    for p in parts[4:]:
+        if p.startswith('pen:') and p[4:] in ('1', '2'):
+            pen = int(p[4:])
+    await do_result(message.author, message.channel, mid, s1, s2, pen)
+
+
+async def predictions_text_command(message):
+    parts = message.content.split()
+    match_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    await do_predictions(message.author, message.channel, match_id)
+
+
+# ---------------------------------------------------------------------------
+# `/` slash commands — same handlers, replying via a Responder.
+# ---------------------------------------------------------------------------
+
+@tree.command(name="next", description="Show the next upcoming match")
+async def slash_next(interaction: discord.Interaction):
+    await send_upcoming(Responder(interaction), limit=1)
+
+
+@tree.command(name="matches", description="Show upcoming matches")
+@app_commands.describe(count="How many matches to show (default 5)")
+async def slash_matches(interaction: discord.Interaction, count: int = 5):
+    await send_upcoming(Responder(interaction), limit=max(1, count))
+
+
+@tree.command(name="team", description="All matches for a team (name or flag)")
+@app_commands.describe(team="Team name or flag emoji, e.g. Brazil or 🇧🇷")
+async def slash_team(interaction: discord.Interaction, team: str):
+    await send_team_matches(Responder(interaction), [team])
+
+
+@tree.command(name="status", description="Group progress overview")
+async def slash_status(interaction: discord.Interaction):
+    await send_group_status(Responder(interaction))
+
+
+@tree.command(name="group", description="Fixtures and standings for a group")
+@app_commands.describe(group="Group letter A–L (leave blank for all)")
+async def slash_group(interaction: discord.Interaction, group: str = ""):
+    await send_group_detail(Responder(interaction), [group] if group else [])
+
+
+@tree.command(name="standings", description="Group tables")
+@app_commands.describe(group="Group letter A–L (leave blank for all)")
+async def slash_standings(interaction: discord.Interaction, group: str = ""):
+    await send_standings(Responder(interaction), [group] if group else [])
+
+
+@tree.command(name="qualified", description="Qualified teams and best third-placed")
+async def slash_qualified(interaction: discord.Interaction):
+    await send_qualified(Responder(interaction))
+
+
+@tree.command(name="bracket", description="Knockout bracket with resolved teams")
+async def slash_bracket(interaction: discord.Interaction):
+    await send_bracket(Responder(interaction))
+
+
+@tree.command(name="predict", description="Predict a match scoreline before kickoff")
+@app_commands.describe(match_id="Match id (from /matches)", home="Home goals", away="Away goals")
+async def slash_predict(interaction: discord.Interaction, match_id: int, home: int, away: int):
+    await do_predict(interaction.user, Responder(interaction, ephemeral=True), match_id, home, away)
+
+
+@tree.command(name="predictions", description="Your predictions, or everyone's for a match")
+@app_commands.describe(match_id="Match id to show everyone's picks (after kickoff)")
+async def slash_predictions(interaction: discord.Interaction, match_id: int = 0):
+    await do_predictions(interaction.user, Responder(interaction, ephemeral=(match_id == 0)),
+                         match_id or None)
+
+
+@tree.command(name="leaderboard", description="Prediction standings")
+async def slash_leaderboard(interaction: discord.Interaction):
+    await send_leaderboard(Responder(interaction))
+
+
+@tree.command(name="result", description="Record a match result (admins only)")
+@app_commands.describe(match_id="Match id", home="Home goals", away="Away goals",
+                       penalties="Penalty shootout winner (for a knockout draw)")
+@app_commands.choices(penalties=[
+    app_commands.Choice(name="Home", value=1),
+    app_commands.Choice(name="Away", value=2),
+])
+async def slash_result(interaction: discord.Interaction, match_id: int, home: int, away: int,
+                       penalties: app_commands.Choice[int] = None):
+    pen = penalties.value if penalties else None
+    await do_result(interaction.user, Responder(interaction), match_id, home, away, pen)
+
+
+@tree.command(name="help", description="List all commands")
+async def slash_help(interaction: discord.Interaction):
+    await send_help(Responder(interaction))
+
 
 # ---------------------------------------------------------------------------
 # World Cup match reminders
@@ -232,7 +397,11 @@ def build_reminder(match, kickoff_utc, lead):
     team2 = resolve_token(match.get('team2')) or match.get('team2')
     context = match.get('group') or match.get('round', '')
     ground = match.get('ground', '')
-    lines = [
+    lines = []
+    # Ping the configured role only on the final (15-minute) reminder.
+    if lead == 15 and REMINDER_ROLE_ID:
+        lines.append(f"<@&{REMINDER_ROLE_ID}>")
+    lines += [
         f"⏰ **Match in {when}!**",
         f"🏟️ **{team_label(team1)} vs {team_label(team2)}**" + (f" — {context}" if context else ""),
         f"🕒 Kickoff: **{discord_timestamp(kickoff_utc)}** ({discord_timestamp(kickoff_utc, 'R')})",
@@ -284,11 +453,41 @@ def get_reminder_channels():
     return channels
 
 
+def match_title(match):
+    """Plain-text 'TeamA vs TeamB' (with flags) for a voice channel status."""
+    results = load_results()
+    t1 = resolve_token(match.get('team1'), results) or match.get('team1')
+    t2 = resolve_token(match.get('team2'), results) or match.get('team2')
+    return f"{team_label(t1)} vs {team_label(t2)}"
+
+
+async def set_voice_status(title):
+    """Set the configured voice channel's status (Discord voice-channel status)."""
+    channel = client.get_channel(VOICE_CHANNEL_ID)
+    if channel is None:
+        print(f'VOICE_CHANNEL_ID {VOICE_CHANNEL_ID} not found')
+        return
+    try:
+        await channel.set_status(title)
+        print(f'Set voice status: {title}')
+    except AttributeError:
+        print('Voice status needs discord.py >= 2.4 (set_status unavailable)')
+    except discord.DiscordException as e:
+        print(f'Failed to set voice status: {e}')
+
+
 @tasks.loop(seconds=30)
 async def check_reminders():
     now = datetime.now(timezone.utc)
     channels = None
     for kickoff_utc, match in MATCHES:
+        # At kickoff, set the voice channel status to the match title.
+        if VOICE_CHANNEL_ID and kickoff_utc <= now < kickoff_utc + REMINDER_GRACE:
+            start_key = match_key(match, 'start')
+            if start_key not in sent_reminders:
+                await set_voice_status(match_title(match))
+                sent_reminders.add(start_key)
+                save_sent_state(sent_reminders)
         for lead in REMINDER_LEAD_MINUTES:
             remind_at = kickoff_utc - timedelta(minutes=lead)
             # Fire only inside [remind_at, remind_at + grace); skips long-past matches on startup
@@ -507,44 +706,25 @@ def is_result_admin(user):
     return str(user.id) in RESULT_ADMIN_IDS
 
 
-async def handle_result_command(message):
-    """^result <mid> <score1> <score2> [pen:1|2]   — record a match result."""
-    if not is_result_admin(message.author):
-        await message.channel.send("🚫 You are not allowed to enter results.")
-        return
-
-    parts = message.content.split()
-    if len(parts) < 4:
-        await message.channel.send(
-            "Usage: `^result <id> <score1> <score2> [pen:1|2]`\n"
-            "Example: `^result 1 2 1`  (use `pen:1`/`pen:2` for a knockout decided on penalties)")
-        return
-
-    try:
-        mid = int(parts[1])
-        s1, s2 = int(parts[2]), int(parts[3])
-    except ValueError:
-        await message.channel.send("⚠️ Id and scores must be whole numbers.")
+async def do_result(user, responder, mid, s1, s2, pen):
+    """Record a match result (admins only). Shared by `/result` and `^result`."""
+    if not is_result_admin(user):
+        await responder.send("🚫 You are not allowed to enter results.")
         return
     if s1 < 0 or s2 < 0:
-        await message.channel.send("⚠️ Scores cannot be negative.")
+        await responder.send("⚠️ Scores cannot be negative.")
         return
 
     match = MATCHES_BY_MID.get(mid)
     if match is None:
-        await message.channel.send(f"⚠️ No match with id `#{mid}`.")
+        await responder.send(f"⚠️ No match with id `#{mid}`.")
         return
-
-    pen = None
-    for p in parts[4:]:
-        if p.startswith('pen:') and p[4:] in ('1', '2'):
-            pen = int(p[4:])
 
     is_knockout = not match.get('group')
     if is_knockout and s1 == s2 and pen is None:
-        await message.channel.send(
-            "⚠️ Knockout match can't end level — add the penalty winner, "
-            "e.g. `pen:1` (home) or `pen:2` (away).")
+        await responder.send(
+            "⚠️ Knockout match can't end level — set the penalty winner "
+            "(`/result` penalties option, or `pen:1` / `pen:2` with `^result`).")
         return
 
     results = load_results()
@@ -565,10 +745,10 @@ async def handle_result_command(message):
         res = results[str(mid)]
         winners = [p['name'] for p in entries.values()
                    if score_prediction(p, res) == POINTS_EXACT]
-        line += f"\n🎯 {len(entries)} prediction(s) scored — see `^leaderboard`."
+        line += f"\n🎯 {len(entries)} prediction(s) scored — see the leaderboard."
         if winners:
             line += f" Exact score by: {', '.join(winners)} 🎉"
-    await message.channel.send(line)
+    await responder.send(line)
 
 
 def format_standings_block(group_letter, results):
@@ -815,74 +995,65 @@ async def send_lines(channel, lines, limit=1900):
         await channel.send(chunk)
 
 
-def display_name(author):
-    return getattr(author, 'display_name', None) or getattr(author, 'name', str(author.id))
+def predictor_name(author):
+    # Use the Discord username (stable handle), not the server display name.
+    return getattr(author, 'name', None) or str(author.id)
 
 
-async def handle_predict(message):
-    """^predict <id> <home> <away> — submit/replace a prediction before kickoff."""
-    parts = message.content.split()
-    if len(parts) < 4:
-        await message.channel.send(
-            "Usage: `^predict <id> <home> <away>` — e.g. `^predict 1 2 1`")
-        return
-    try:
-        mid, s1, s2 = int(parts[1]), int(parts[2]), int(parts[3])
-    except ValueError:
-        await message.channel.send("⚠️ Id and scores must be whole numbers.")
-        return
+async def do_predict(user, responder, mid, s1, s2):
+    """Submit/replace a prediction before kickoff. Shared by `/predict` and `^predict`."""
     if s1 < 0 or s2 < 0:
-        await message.channel.send("⚠️ Scores cannot be negative.")
+        await responder.send("⚠️ Scores cannot be negative.")
         return
 
     match = MATCHES_BY_MID.get(mid)
     if match is None:
-        await message.channel.send(f"⚠️ No match with id `#{mid}`.")
+        await responder.send(f"⚠️ No match with id `#{mid}`.")
         return
     kickoff = parse_match_datetime(match)
     if kickoff is None:
-        await message.channel.send("⚠️ This match has no scheduled time.")
+        await responder.send("⚠️ This match has no scheduled time.")
         return
     if datetime.now(timezone.utc) >= kickoff:
-        await message.channel.send(f"🔒 Predictions for `#{mid}` are closed — the match has started.")
+        await responder.send(f"🔒 Predictions for `#{mid}` are closed — the match has started.")
         return
 
     predictions = load_predictions()
-    predictions.setdefault(str(mid), {})[str(message.author.id)] = {
-        's1': s1, 's2': s2, 'name': display_name(message.author),
+    predictions.setdefault(str(mid), {})[str(user.id)] = {
+        's1': s1, 's2': s2, 'name': predictor_name(user),
     }
     save_predictions(predictions)
 
     t1 = resolve_token(match.get('team1')) or match.get('team1')
     t2 = resolve_token(match.get('team2')) or match.get('team2')
-    await message.channel.send(
+    await responder.send(
         f"✅ Prediction saved: **{team_label(t1)} {s1}–{s2} {team_label(t2)}** "
         f"(locks {discord_timestamp(kickoff, 'R')})")
 
 
-async def send_predictions(message, args):
-    """^predictions          — your own predictions and points.
-       ^predictions <id>      — everyone's predictions for a match (after kickoff)."""
+async def do_predictions(user, responder, match_id=None):
+    """match_id given  -> everyone's predictions for that match (after kickoff).
+       match_id None   -> the caller's own predictions and points."""
     predictions = load_predictions()
     results = load_results()
 
-    if args and args[0].isdigit():
-        mid = int(args[0])
+    if match_id is not None:
+        mid = match_id
         match = MATCHES_BY_MID.get(mid)
         if match is None:
-            await message.channel.send(f"⚠️ No match with id `#{mid}`.")
+            await responder.send(f"⚠️ No match with id `#{mid}`.")
             return
         entries = predictions.get(str(mid), {})
         kickoff = parse_match_datetime(match)
         not_started = kickoff and datetime.now(timezone.utc) < kickoff
         # Reveal once the match has kicked off, or once a result exists.
         if not_started and str(mid) not in results:
-            await message.channel.send(
+            await responder.send(
                 f"🔒 Predictions for `#{mid}` are hidden until kickoff "
                 f"({len(entries)} so far, locks {discord_timestamp(kickoff, 'R')}).")
             return
         if not entries:
-            await message.channel.send(f"No predictions were made for `#{mid}`.")
+            await responder.send(f"No predictions were made for `#{mid}`.")
             return
         t1 = resolve_token(match.get('team1'), results) or match.get('team1')
         t2 = resolve_token(match.get('team2'), results) or match.get('team2')
@@ -896,18 +1067,18 @@ async def send_predictions(message, args):
         for p in rows:
             tag = f" · **{score_prediction(p, res)} pts**" if res else ""
             lines.append(f"• {p.get('name', '?')}: {p['s1']}–{p['s2']}{tag}")
-        await send_lines(message.channel, lines)
+        await send_lines(responder, lines)
         return
 
     # No id: caller's own predictions
-    uid = str(message.author.id)
+    uid = str(user.id)
     mine = sorted(((int(mid), entries[uid]) for mid, entries in predictions.items()
                    if uid in entries), key=lambda x: x[0])
     if not mine:
-        await message.channel.send(
-            "You have no predictions yet. Use `^predict <id> <home> <away>`.")
+        await responder.send(
+            "You have no predictions yet. Use `/predict` or `^predict <id> <home> <away>`.")
         return
-    lines = [f"**{display_name(message.author)}'s predictions**"]
+    lines = [f"**{predictor_name(user)}'s predictions**"]
     total = 0
     for mid, p in mine:
         match = MATCHES_BY_MID.get(mid)
@@ -922,7 +1093,7 @@ async def send_predictions(message, args):
             tag = " · _pending_"
         lines.append(f"`#{mid:>3}` {team_label(t1)} {p['s1']}–{p['s2']} {team_label(t2)}{tag}")
     lines.append(f"\n**Total: {total} pts**")
-    await send_lines(message.channel, lines)
+    await send_lines(responder, lines)
 
 
 async def send_leaderboard(channel):
@@ -942,22 +1113,22 @@ async def send_leaderboard(channel):
 
 async def send_help(channel):
     await channel.send(
-        "**World Cup bot commands**\n"
-        "`^next` — next match\n"
-        "`^matches [n]` — next *n* matches (default 5)\n"
-        "`^team <name|flag>` — all matches for a team, e.g. `^team Brazil` or `^team 🇧🇷`\n"
-        "`^status` — group progress at a glance (played / leaders / qualified)\n"
-        "`^group [letters]` — fixtures + standings per group (all, or e.g. `^group A`)\n"
-        "`^standings [group]` — group tables (all groups, or e.g. `^standings A`)\n"
-        "`^qualified` — group winners/runners-up and best third-placed teams\n"
-        "`^bracket` — knockout bracket with resolved teams\n"
+        "**World Cup bot** — every command works as a slash `/cmd` or text `^cmd`\n"
+        "`/next` · `^next` — next match\n"
+        "`/matches [count]` · `^matches [n]` — upcoming matches (default 5)\n"
+        "`/team <name|flag>` · `^team …` — a team's matches (e.g. Brazil or 🇧🇷)\n"
+        "`/status` · `^status` — group progress at a glance\n"
+        "`/group [letter]` · `^group …` — fixtures + standings per group\n"
+        "`/standings [group]` · `^standings …` — group tables\n"
+        "`/qualified` · `^qualified` — winners/runners-up and best third-placed\n"
+        "`/bracket` · `^bracket` — knockout bracket with resolved teams\n"
         "**Predictions**\n"
-        "`^predict <id> <home> <away>` — predict a score before kickoff (e.g. `^predict 1 2 1`)\n"
-        "`^predictions [id]` — your predictions, or everyone's for a match (after kickoff)\n"
-        "`^leaderboard` — prediction standings (alias `^lb`)\n"
+        "`/predict <id> <home> <away>` · `^predict …` — predict before kickoff\n"
+        "`/predictions [id]` · `^predictions …` — your picks, or everyone's for a match\n"
+        "`/leaderboard` · `^leaderboard` (`^lb`) — prediction standings\n"
         f"_Points: {POINTS_EXACT} exact · {POINTS_GD} right result+GD · {POINTS_RESULT} right result_\n"
         "**Admin**\n"
-        "`^result <id> <s1> <s2> [pen:1|2]` — record a result (admins only)")
+        "`/result <id> <home> <away> [penalties]` · `^result <id> <s1> <s2> [pen:1|2]` — record a result (admins only)")
 
 
 client.run(DISCORD_TOKEN)
