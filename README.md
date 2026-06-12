@@ -19,6 +19,7 @@ Every command is available **two ways** — as a Discord slash command (`/next`,
    DISCORD_TOKEN=your-bot-token
    RESULT_ADMIN_IDS=123456789012345678   # Discord user IDs allowed to enter results
    # Optional overrides:
+   # RESULT_ADMIN_ROLE_ID=123456789012345678  # anyone with this role can also enter results
    # GUILD_ID=123456789012345678         # sync slash commands to one server instantly
    # REMINDER_CHANNEL=general            # reminders channel by name (default)
    # REMINDER_CHANNEL_ID=123456789012345678  # OR target one channel by ID (takes precedence)
@@ -163,7 +164,8 @@ Group A  (in progress)
 
 ## Recording results
 
-Only users listed in `RESULT_ADMIN_IDS` can record results.
+Only users listed in `RESULT_ADMIN_IDS`, or anyone holding `RESULT_ADMIN_ROLE_ID`,
+can record results.
 
 ```
 ^result <id> <score1> <score2> [pen:1|2]
@@ -273,6 +275,7 @@ shouts out anyone who nailed the exact score.
 | --------------------- | --------------- | --------------------------------------------------------------------- |
 | `DISCORD_TOKEN`       | —               | Bot token (required)                                                  |
 | `RESULT_ADMIN_IDS`    | _(empty)_       | Comma-separated Discord user IDs allowed to record results            |
+| `RESULT_ADMIN_ROLE_ID`| _(unset)_       | Anyone with this role may also record results                        |
 | `GUILD_ID`            | _(unset)_       | Sync slash commands to this one server instantly (else global sync)   |
 | `REMINDER_CHANNEL`    | `general`       | Reminders channel **by name** (posts to every matching channel)       |
 | `REMINDER_CHANNEL_ID` | _(unset)_       | Reminders channel **by ID** — takes precedence over the name when set |

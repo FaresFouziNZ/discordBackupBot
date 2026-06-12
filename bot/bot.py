@@ -28,6 +28,8 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reminder_
 RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results.json')
 # Discord user IDs allowed to enter match results (comma-separated). For now: user "x".
 RESULT_ADMIN_IDS = {x.strip() for x in os.getenv('RESULT_ADMIN_IDS', '').split(',') if x.strip()}
+# Optional: anyone with this role may also record results.
+RESULT_ADMIN_ROLE_ID = int(os.getenv('RESULT_ADMIN_ROLE_ID')) if os.getenv('RESULT_ADMIN_ROLE_ID', '').strip().isdigit() else None
 
 # Prediction game configuration
 PREDICTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'predictions.json')
@@ -703,7 +705,11 @@ def _match_outcome(match, results, _seen, loser):
 # ---------------------------------------------------------------------------
 
 def is_result_admin(user):
-    return str(user.id) in RESULT_ADMIN_IDS
+    if str(user.id) in RESULT_ADMIN_IDS:
+        return True
+    if RESULT_ADMIN_ROLE_ID is not None:
+        return any(role.id == RESULT_ADMIN_ROLE_ID for role in getattr(user, 'roles', []))
+    return False
 
 
 async def do_result(user, responder, mid, s1, s2, pen):
