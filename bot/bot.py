@@ -65,12 +65,14 @@ class Responder:
         self.ephemeral = ephemeral
         self._responded = False
 
-    async def send(self, content):
+    async def send(self, content=None, **kwargs):
+        # kwargs (files=, file=, view=, …) are forwarded so the same handlers
+        # can attach backups or buttons whether replying to a slash or a channel.
         if not self._responded:
-            await self.interaction.response.send_message(content, ephemeral=self.ephemeral)
+            await self.interaction.response.send_message(content, ephemeral=self.ephemeral, **kwargs)
             self._responded = True
         else:
-            await self.interaction.followup.send(content, ephemeral=self.ephemeral)
+            await self.interaction.followup.send(content, ephemeral=self.ephemeral, **kwargs)
 
 
 @client.event
@@ -79,6 +81,9 @@ async def on_ready():
     print(f'Bot connected as {client.user}')
     MATCHES = load_matches()
     print(f'Loaded {len(MATCHES)} matches for reminders')
+    # Re-attach the reminder "Predict" buttons so they keep working across
+    # restarts (the custom_id carries the match id, decoded on click).
+    client.add_dynamic_items(PredictButton)
     try:
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -136,6 +141,12 @@ async def on_message(message):
     elif message.content.startswith('^leaderboard') or message.content.startswith('^lb'):
         await send_leaderboard(message.channel)
         return
+    elif message.content.startswith('^backup'):
+        await do_backup(message.author, message.channel)
+        return
+    elif message.content.startswith('^upload'):
+        await upload_text_command(message)
+        return
     elif message.content.startswith('^help'):
         await send_help(message.channel)
         return
@@ -180,6 +191,14 @@ async def predictions_text_command(message):
     parts = message.content.split()
     match_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
     await do_predictions(message.author, message.channel, match_id)
+
+
+async def upload_text_command(message):
+    if not message.attachments:
+        await message.channel.send(
+            "⚠️ Attach a predictions backup (`.json`) to the `^upload` message.")
+        return
+    await do_upload(message.author, message.channel, message.attachments[0])
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +265,17 @@ async def slash_predictions(interaction: discord.Interaction, match_id: int = 0)
 @tree.command(name="leaderboard", description="Prediction standings")
 async def slash_leaderboard(interaction: discord.Interaction):
     await send_leaderboard(Responder(interaction))
+
+
+@tree.command(name="backup", description="Download predictions + results backup (admins only)")
+async def slash_backup(interaction: discord.Interaction):
+    await do_backup(interaction.user, Responder(interaction, ephemeral=True))
+
+
+@tree.command(name="upload", description="Restore predictions from a backup file (admins only)")
+@app_commands.describe(file="A predictions backup (.json) to restore")
+async def slash_upload(interaction: discord.Interaction, file: discord.Attachment):
+    await do_upload(interaction.user, Responder(interaction, ephemeral=True), file)
 
 
 @tree.command(name="result", description="Record a match result (admins only)")
@@ -506,7 +536,8 @@ async def check_reminders():
             message = build_reminder(match, kickoff_utc, lead)
             for channel in channels:
                 try:
-                    await channel.send(message)
+                    # A fresh view per send; the button lets users predict inline.
+                    await channel.send(message, view=predict_view(match['mid']))
                     print(f'Sent reminder to #{channel.name}: {key}')
                 except discord.DiscordException as e:
                     print(f'Failed to send reminder: {e}')
@@ -1117,6 +1148,129 @@ async def send_leaderboard(channel):
     await send_lines(channel, lines)
 
 
+# ---------------------------------------------------------------------------
+# Reminder "Predict" button
+#
+# Reminder messages carry a button whose custom_id encodes the match id
+# (`predict:<mid>`). Clicking it opens a modal to enter the scoreline, which
+# feeds the same do_predict() used by the slash/text commands. The DynamicItem
+# is registered in on_ready so the buttons survive bot restarts.
+# ---------------------------------------------------------------------------
+
+class PredictModal(discord.ui.Modal):
+    def __init__(self, mid, match):
+        super().__init__(title=f"Predict — match #{mid}")
+        self.mid = mid
+        t1 = resolve_token(match.get('team1')) or match.get('team1') or 'Home'
+        t2 = resolve_token(match.get('team2')) or match.get('team2') or 'Away'
+        # Modal labels can't render flag emoji reliably, so use plain names (max 45 chars).
+        self.home = discord.ui.TextInput(label=f"{t1} goals"[:45], placeholder="e.g. 2", max_length=2)
+        self.away = discord.ui.TextInput(label=f"{t2} goals"[:45], placeholder="e.g. 1", max_length=2)
+        self.add_item(self.home)
+        self.add_item(self.away)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            s1, s2 = int(self.home.value), int(self.away.value)
+        except ValueError:
+            await interaction.response.send_message("⚠️ Scores must be whole numbers.", ephemeral=True)
+            return
+        await do_predict(interaction.user, Responder(interaction, ephemeral=True), self.mid, s1, s2)
+
+
+class PredictButton(discord.ui.DynamicItem[discord.ui.Button], template=r'predict:(?P<mid>\d+)'):
+    def __init__(self, mid):
+        self.mid = mid
+        super().__init__(discord.ui.Button(
+            label='Predict', emoji='🎯',
+            style=discord.ButtonStyle.primary,
+            custom_id=f'predict:{mid}',
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match['mid']))
+
+    async def callback(self, interaction: discord.Interaction):
+        match = MATCHES_BY_MID.get(self.mid)
+        if match is None:
+            await interaction.response.send_message(f"⚠️ No match with id `#{self.mid}`.", ephemeral=True)
+            return
+        kickoff = parse_match_datetime(match)
+        if kickoff and datetime.now(timezone.utc) >= kickoff:
+            await interaction.response.send_message(
+                f"🔒 Predictions for `#{self.mid}` are closed — the match has started.", ephemeral=True)
+            return
+        await interaction.response.send_modal(PredictModal(self.mid, match))
+
+
+def predict_view(mid):
+    """A view holding the reminder's Predict button for the given match."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(PredictButton(mid))
+    return view
+
+
+# ---------------------------------------------------------------------------
+# Backup / restore of the prediction game data (admins only)
+# ---------------------------------------------------------------------------
+
+async def do_backup(user, responder):
+    """Send predictions.json and results.json as downloadable attachments."""
+    if not is_result_admin(user):
+        await responder.send("🚫 You are not allowed to download backups.")
+        return
+    files = []
+    for path, name in ((PREDICTIONS_FILE, 'predictions.json'), (RESULTS_FILE, 'results.json')):
+        if os.path.exists(path):
+            files.append(discord.File(path, filename=name))
+    if not files:
+        await responder.send("No data to back up yet — no predictions or results recorded.")
+        return
+    await responder.send("🗄️ **Backup** — predictions and results:", files=files)
+
+
+def validate_predictions(data):
+    """Check an uploaded object matches the predictions shape: {mid: {uid: {s1,s2,name}}}."""
+    if not isinstance(data, dict):
+        return False, "Top level must be an object mapping match id → predictions."
+    for mid, entries in data.items():
+        if not str(mid).isdigit():
+            return False, f"Match id `{mid}` is not a number."
+        if not isinstance(entries, dict):
+            return False, f"Predictions for match `{mid}` must be an object."
+        for uid, pred in entries.items():
+            if not isinstance(pred, dict) or 's1' not in pred or 's2' not in pred:
+                return False, f"Prediction for match `{mid}` / user `{uid}` is missing s1/s2."
+            if not isinstance(pred['s1'], int) or not isinstance(pred['s2'], int):
+                return False, f"Scores for match `{mid}` / user `{uid}` must be whole numbers."
+    return True, "ok"
+
+
+async def do_upload(user, responder, attachment):
+    """Restore predictions from an uploaded backup file (replaces the current file)."""
+    if not is_result_admin(user):
+        await responder.send("🚫 You are not allowed to upload predictions.")
+        return
+    if attachment is None:
+        await responder.send("⚠️ Attach a predictions backup (`.json`) to upload.")
+        return
+    try:
+        raw = await attachment.read()
+        data = json.loads(raw.decode('utf-8'))
+    except (discord.DiscordException, UnicodeDecodeError, json.JSONDecodeError) as e:
+        await responder.send(f"⚠️ Couldn't read `{attachment.filename}` as JSON: {e}")
+        return
+    ok, msg = validate_predictions(data)
+    if not ok:
+        await responder.send(f"⚠️ That file isn't a valid predictions backup — {msg}")
+        return
+    save_predictions(data)
+    n_preds = sum(len(v) for v in data.values())
+    await responder.send(
+        f"✅ Restored predictions: **{n_preds}** prediction(s) across **{len(data)}** match(es).")
+
+
 async def send_help(channel):
     await channel.send(
         "**World Cup bot** — every command works as a slash `/cmd` or text `^cmd`\n"
@@ -1130,11 +1284,14 @@ async def send_help(channel):
         "`/bracket` · `^bracket` — knockout bracket with resolved teams\n"
         "**Predictions**\n"
         "`/predict <id> <home> <away>` · `^predict …` — predict before kickoff\n"
+        "_…or just tap the 🎯 **Predict** button on a match reminder._\n"
         "`/predictions [id]` · `^predictions …` — your picks, or everyone's for a match\n"
         "`/leaderboard` · `^leaderboard` (`^lb`) — prediction standings\n"
         f"_Points: {POINTS_EXACT} exact · {POINTS_GD} right result+GD · {POINTS_RESULT} right result_\n"
         "**Admin**\n"
-        "`/result <id> <home> <away> [penalties]` · `^result <id> <s1> <s2> [pen:1|2]` — record a result (admins only)")
+        "`/result <id> <home> <away> [penalties]` · `^result <id> <s1> <s2> [pen:1|2]` — record a result\n"
+        "`/backup` · `^backup` — download a predictions + results backup\n"
+        "`/upload <file>` · `^upload` (with attachment) — restore predictions from a backup")
 
 
 client.run(DISCORD_TOKEN)
