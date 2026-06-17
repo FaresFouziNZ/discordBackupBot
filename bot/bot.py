@@ -22,6 +22,7 @@ REMINDER_ROLE_ID = int(os.getenv('REMINDER_ROLE_ID')) if os.getenv('REMINDER_ROL
 VOICE_CHANNEL_ID = int(os.getenv('VOICE_CHANNEL_ID')) if os.getenv('VOICE_CHANNEL_ID', '').strip().isdigit() else None
 REMINDER_LEAD_MINUTES = [60, 15]                 # remind 1 hour and 15 minutes before
 REMINDER_GRACE = timedelta(minutes=10)           # max lateness before a reminder is skipped
+RESULT_REMINDER_DELAY = timedelta(hours=2)       # nudge admins to record a result this long after kickoff
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reminder_state.json')
 
 # Results / standings configuration
@@ -36,6 +37,11 @@ PREDICTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pre
 POINTS_EXACT = 5     # exact scoreline
 POINTS_GD = 3        # correct result and goal difference (but not exact)
 POINTS_RESULT = 2    # correct result only (right winner / draw)
+
+# Timezone used to decide which calendar day "today"/"tomorrow" falls on
+# (hours offset from UTC, e.g. -6 for the host cities). Default: UTC.
+DAY_UTC_OFFSET = int(os.getenv('DAY_UTC_OFFSET')) if os.getenv('DAY_UTC_OFFSET', '').lstrip('-').isdigit() else 0
+DAY_TZ = timezone(timedelta(hours=DAY_UTC_OFFSET))
 
 # Loaded on_ready
 MATCHES = []           # list of (kickoff_utc, match_dict)
@@ -81,9 +87,9 @@ async def on_ready():
     print(f'Bot connected as {client.user}')
     MATCHES = load_matches()
     print(f'Loaded {len(MATCHES)} matches for reminders')
-    # Re-attach the reminder "Predict" buttons so they keep working across
-    # restarts (the custom_id carries the match id, decoded on click).
-    client.add_dynamic_items(PredictButton)
+    # Re-attach the reminder buttons so they keep working across restarts
+    # (each custom_id carries the match id, decoded on click).
+    client.add_dynamic_items(PredictButton, RecordButton)
     try:
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -110,6 +116,12 @@ async def on_message(message):
         parts = message.content.split()
         limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 5
         await send_upcoming(message.channel, limit=limit)
+        return
+    elif message.content.startswith('^today'):
+        await send_day_matches(message.channel, 0, 'today')
+        return
+    elif message.content.startswith('^tomorrow') or message.content.startswith('^tmw'):
+        await send_day_matches(message.channel, 1, 'tomorrow')
         return
     elif message.content.startswith('^result'):
         await result_text_command(message)
@@ -214,6 +226,16 @@ async def slash_next(interaction: discord.Interaction):
 @app_commands.describe(count="How many matches to show (default 5)")
 async def slash_matches(interaction: discord.Interaction, count: int = 5):
     await send_upcoming(Responder(interaction), limit=max(1, count))
+
+
+@tree.command(name="today", description="Matches kicking off today")
+async def slash_today(interaction: discord.Interaction):
+    await send_day_matches(Responder(interaction), 0, 'today')
+
+
+@tree.command(name="tomorrow", description="Matches kicking off tomorrow")
+async def slash_tomorrow(interaction: discord.Interaction):
+    await send_day_matches(Responder(interaction), 1, 'tomorrow')
 
 
 @tree.command(name="team", description="All matches for a team (name or flag)")
@@ -443,6 +465,24 @@ def build_reminder(match, kickoff_utc, lead):
     return "\n".join(lines)
 
 
+def build_record_reminder(match, kickoff_utc):
+    """Posted ~2 hours after kickoff to prompt admins to record the result."""
+    team1 = resolve_token(match.get('team1')) or match.get('team1')
+    team2 = resolve_token(match.get('team2')) or match.get('team2')
+    context = match.get('group') or match.get('round', '')
+    lines = []
+    # Ping whoever may record results, if a role is configured.
+    if RESULT_ADMIN_ROLE_ID:
+        lines.append(f"<@&{RESULT_ADMIN_ROLE_ID}>")
+    lines += [
+        "📝 **Time to record a result!**",
+        f"🏟️ **{team_label(team1)} vs {team_label(team2)}**" + (f" — {context}" if context else ""),
+        f"🕒 Kicked off {discord_timestamp(kickoff_utc, 'R')} · match `#{match['mid']}`",
+        "Tap **Record result** below, or use `/result`.",
+    ]
+    return "\n".join(lines)
+
+
 def format_match_line(kickoff_utc, match):
     team1 = resolve_token(match.get('team1')) or match.get('team1')
     team2 = resolve_token(match.get('team2')) or match.get('team2')
@@ -463,6 +503,37 @@ async def send_upcoming(channel, limit=5):
     header = "⚽ **Next match:**" if limit == 1 else f"⚽ **Next {len(upcoming)} matches:**"
     body = "\n".join(format_match_line(kickoff, match) for kickoff, match in upcoming)
     await channel.send(f"{header}\n{body}")
+
+
+def format_day_line(kickoff_utc, match, results):
+    """One fixture line for a day listing: shows the score if a result is in,
+    otherwise the kickoff time and live countdown. Day is known, so time only."""
+    t1 = resolve_token(match.get('team1'), results) or match.get('team1')
+    t2 = resolve_token(match.get('team2'), results) or match.get('team2')
+    context = match.get('group') or match.get('round', '')
+    suffix = f" · {context}" if context else ""
+    res = results.get(str(match['mid']))
+    ts = discord_timestamp(kickoff_utc, 't')
+    if res:
+        return (f"`#{match['mid']:>3}` {ts} — "
+                f"{team_label(t1)} **{res['s1']}–{res['s2']}** {team_label(t2)}{suffix}")
+    return (f"`#{match['mid']:>3}` {ts} ({discord_timestamp(kickoff_utc, 'R')}) — "
+            f"{team_label(t1)} vs {team_label(t2)}{suffix}")
+
+
+async def send_day_matches(channel, offset_days, label):
+    """Matches whose kickoff falls on today (offset 0) or tomorrow (offset 1),
+    using DAY_TZ to decide the calendar day."""
+    target = (datetime.now(DAY_TZ) + timedelta(days=offset_days)).date()
+    day = sorted((m for m in MATCHES if m[0].astimezone(DAY_TZ).date() == target),
+                 key=lambda m: m[0])
+    if not day:
+        await channel.send(f"No matches {label}. 🏁")
+        return
+    results = load_results()
+    lines = [f"⚽ **{label.capitalize()}'s matches** ({len(day)}):"]
+    lines += [format_day_line(kickoff, match, results) for kickoff, match in day]
+    await send_lines(channel, lines)
 
 
 def get_reminder_channels():
@@ -543,6 +614,25 @@ async def check_reminders():
                     print(f'Failed to send reminder: {e}')
             sent_reminders.add(key)
             save_sent_state(sent_reminders)
+
+        # Two hours after kickoff, nudge admins (once) to record the result,
+        # unless it's already in. A button opens a modal to enter the score.
+        record_at = kickoff_utc + RESULT_REMINDER_DELAY
+        if (record_at <= now < record_at + REMINDER_GRACE
+                and match_key(match, 'record') not in sent_reminders
+                and str(match['mid']) not in load_results()):
+            if channels is None:
+                channels = get_reminder_channels()
+            if channels:
+                message = build_record_reminder(match, kickoff_utc)
+                for channel in channels:
+                    try:
+                        await channel.send(message, view=record_view(match['mid']))
+                        print(f"Sent record reminder to #{channel.name}: {match_key(match, 'record')}")
+                    except discord.DiscordException as e:
+                        print(f'Failed to send record reminder: {e}')
+                sent_reminders.add(match_key(match, 'record'))
+                save_sent_state(sent_reminders)
 
 
 @check_reminders.before_loop
@@ -780,11 +870,13 @@ async def do_result(user, responder, mid, s1, s2, pen):
     entries = load_predictions().get(str(mid), {})
     if entries:
         res = results[str(mid)]
-        winners = [p['name'] for p in entries.values()
+        # Ping (not just name) whoever nailed the exact scoreline.
+        winners = [uid for uid, p in entries.items()
                    if score_prediction(p, res) == POINTS_EXACT]
         line += f"\n🎯 {len(entries)} prediction(s) scored — see the leaderboard."
         if winners:
-            line += f" Exact score by: {', '.join(winners)} 🎉"
+            mentions = ', '.join(f"<@{uid}>" for uid in winners)
+            line += f" Exact score by: {mentions} 🎉"
     await responder.send(line)
 
 
@@ -1211,6 +1303,74 @@ def predict_view(mid):
     return view
 
 
+# Penalty-winner words accepted in the record modal's optional field.
+_PEN_HOME = {'1', 'h', 'home'}
+_PEN_AWAY = {'2', 'a', 'away'}
+
+
+class RecordModal(discord.ui.Modal):
+    def __init__(self, mid, match):
+        super().__init__(title=f"Record result — match #{mid}")
+        self.mid = mid
+        t1 = resolve_token(match.get('team1')) or match.get('team1') or 'Home'
+        t2 = resolve_token(match.get('team2')) or match.get('team2') or 'Away'
+        self.home = discord.ui.TextInput(label=f"{t1} goals"[:45], placeholder="e.g. 2", max_length=2)
+        self.away = discord.ui.TextInput(label=f"{t2} goals"[:45], placeholder="e.g. 1", max_length=2)
+        # Only needed when a knockout tie ends level; left blank otherwise.
+        self.pen = discord.ui.TextInput(
+            label="Penalty winner (knockout draw only)"[:45],
+            placeholder="home / away — leave blank if not needed",
+            required=False, max_length=4)
+        self.add_item(self.home)
+        self.add_item(self.away)
+        self.add_item(self.pen)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            s1, s2 = int(self.home.value), int(self.away.value)
+        except ValueError:
+            await interaction.response.send_message("⚠️ Scores must be whole numbers.", ephemeral=True)
+            return
+        pen_raw = (self.pen.value or '').strip().lower()
+        if pen_raw and pen_raw not in _PEN_HOME and pen_raw not in _PEN_AWAY:
+            await interaction.response.send_message(
+                "⚠️ Penalty winner must be `home` or `away` (or left blank).", ephemeral=True)
+            return
+        pen = 1 if pen_raw in _PEN_HOME else 2 if pen_raw in _PEN_AWAY else None
+        await do_result(interaction.user, Responder(interaction), self.mid, s1, s2, pen)
+
+
+class RecordButton(discord.ui.DynamicItem[discord.ui.Button], template=r'record:(?P<mid>\d+)'):
+    def __init__(self, mid):
+        self.mid = mid
+        super().__init__(discord.ui.Button(
+            label='Record result', emoji='📝',
+            style=discord.ButtonStyle.success,
+            custom_id=f'record:{mid}',
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match['mid']))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_result_admin(interaction.user):
+            await interaction.response.send_message("🚫 You are not allowed to enter results.", ephemeral=True)
+            return
+        match = MATCHES_BY_MID.get(self.mid)
+        if match is None:
+            await interaction.response.send_message(f"⚠️ No match with id `#{self.mid}`.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RecordModal(self.mid, match))
+
+
+def record_view(mid):
+    """A view holding the 'Record result' button for the given match."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(RecordButton(mid))
+    return view
+
+
 # ---------------------------------------------------------------------------
 # Backup / restore of the prediction game data (admins only)
 # ---------------------------------------------------------------------------
@@ -1276,6 +1436,8 @@ async def send_help(channel):
         "**World Cup bot** — every command works as a slash `/cmd` or text `^cmd`\n"
         "`/next` · `^next` — next match\n"
         "`/matches [count]` · `^matches [n]` — upcoming matches (default 5)\n"
+        "`/today` · `^today` — matches kicking off today\n"
+        "`/tomorrow` · `^tomorrow` (`^tmw`) — matches kicking off tomorrow\n"
         "`/team <name|flag>` · `^team …` — a team's matches (e.g. Brazil or 🇧🇷)\n"
         "`/status` · `^status` — group progress at a glance\n"
         "`/group [letter]` · `^group …` — fixtures + standings per group\n"
@@ -1290,6 +1452,7 @@ async def send_help(channel):
         f"_Points: {POINTS_EXACT} exact · {POINTS_GD} right result+GD · {POINTS_RESULT} right result_\n"
         "**Admin**\n"
         "`/result <id> <home> <away> [penalties]` · `^result <id> <s1> <s2> [pen:1|2]` — record a result\n"
+        "_…or tap the 📝 **Record result** button on the post-match reminder._\n"
         "`/backup` · `^backup` — download a predictions + results backup\n"
         "`/upload <file>` · `^upload` (with attachment) — restore predictions from a backup")
 
