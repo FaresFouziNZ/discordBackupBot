@@ -57,16 +57,22 @@ For **every** match in `worldcup.json`, the bot automatically posts to the
 reminders channel:
 
 - **1 hour before** kickoff
-- **15 minutes before** kickoff
+- **15 minutes before** kickoff — also pings `REMINDER_ROLE_ID`, if set
+- **~2 hours after** kickoff — a "record result" nudge for admins (only if the
+  result isn't in yet), pinging `RESULT_ADMIN_ROLE_ID` if set
 
 Each reminder shows the teams (with flags), the kickoff time, and a live
 countdown. Times use Discord's native timestamp format, so **every user sees
 the time in their own local timezone** — no manual conversion needed.
 
-- The **15-minute reminder** also pings `REMINDER_ROLE_ID`, if set.
-- At **kickoff**, if `VOICE_CHANNEL_ID` is set, the bot sets that voice channel's
-  status to the match title (e.g. `🇲🇽 Mexico vs 🇿🇦 South Africa`). Requires
-  discord.py ≥ 2.4 and the **Set Voice Channel Status** permission.
+The pre-match reminders carry a 🎯 **Predict** button, and the post-match
+reminder carries a 📝 **Record result** button (admins only). Each opens a small
+form, so users can predict or record without typing a command. These buttons
+keep working after a restart.
+
+At **kickoff**, if `VOICE_CHANNEL_ID` is set, the bot sets that voice channel's
+status to the match title (e.g. `🇲🇽 Mexico vs 🇿🇦 South Africa`). Requires
+discord.py ≥ 2.4 and the **Set Voice Channel Status** permission.
 
 Reminders are de-duplicated and survive restarts (tracked in
 `bot/reminder_state.json`). If the bot is offline through a reminder window,
@@ -81,19 +87,29 @@ that reminder is skipped rather than fired late.
 | `^help`                             | List all commands                                                    |
 | `^next`                             | Show the next upcoming match                                         |
 | `^matches [n]`                      | Show the next _n_ matches (default 5), e.g. `^matches 10`            |
+| `^today`                            | Matches kicking off today                                            |
+| `^tomorrow`                         | Matches kicking off tomorrow (alias `^tmw`)                          |
 | `^team <name\|flag>`                | All matches for a team, e.g. `^team Brazil` or `^team 🇧🇷`            |
 | `^status`                           | Group progress overview (one line per group)                         |
 | `^group [letters]`                  | Fixtures **and** standings per group — all, or e.g. `^group A`       |
 | `^standings [group]`                | Group tables only — all groups, or one, e.g. `^standings A`          |
 | `^qualified`                        | Group winners, runners-up, and best third-placed teams               |
+| `^thirds`                           | Best third-placed **race** — ranked live, top 8 of 12 advance        |
+| `^results`                          | All recorded match results (in kickoff order)                        |
 | `^bracket`                          | Knockout bracket with resolved teams and scores                      |
 | `^predict <id> <home> <away>`       | Predict a scoreline before kickoff, e.g. `^predict 1 2 1`            |
 | `^predictions [id]`                 | Your predictions & points, or everyone's for a match (after kickoff) |
 | `^leaderboard`                      | Prediction standings (alias `^lb`)                                   |
 | `^result <id> <s1> <s2> [pen:1\|2]` | Record a match result (**admins only**)                              |
+| `^backup`                           | Download a predictions + results backup (**admins only**)            |
+| `^upload` _(+ attachment)_          | Restore predictions from a backup file (**admins only**)             |
 
 Every match in the listings is shown with an **id** (`#12`) — that's what you
 pass to `^result`.
+
+> Tip: you don't always need the id. Match reminders carry a 🎯 **Predict**
+> button, and the post-match reminder carries a 📝 **Record result** button
+> (admins) — both open a quick form, so most people never type a command.
 
 ### `^team` example
 
@@ -201,7 +217,8 @@ automatically as results come in:
 - Group positions are finalized once **all six** matches in that group have
   results.
 - The eight best third-placed teams are determined once **all twelve** groups
-  are complete.
+  are complete. Use `^thirds` to watch the race live — it ranks each group's
+  current 3rd-placed team and marks the top 8 (provisional until groups finish).
 - Knockout winners propagate up the bracket automatically, so `^bracket`
   always reflects the latest entered results.
 
@@ -241,7 +258,22 @@ whole tournament — the player with the most points by the final wins.
 ```
 
 When a result is entered, the bot announces how many predictions were scored and
-shouts out anyone who nailed the exact score.
+@-mentions anyone who nailed the exact score.
+
+### Backup & restore (admins)
+
+Match data lives in JSON files inside the container, so it's worth backing up:
+
+```
+^backup            # bot DMs/posts predictions.json + results.json to download
+^upload  (+file)   # attach a predictions.json backup to restore it
+/backup            # same, as a slash command (reply is private)
+/upload <file>     # same, file picked via the slash command
+```
+
+`^upload` / `/upload` validates the file's shape before replacing
+`predictions.json`, so a malformed file is rejected rather than wiping data.
+Both commands are restricted to result admins.
 
 ---
 
@@ -281,4 +313,5 @@ shouts out anyone who nailed the exact score.
 | `REMINDER_CHANNEL_ID` | _(unset)_       | Reminders channel **by ID** — takes precedence over the name when set |
 | `REMINDER_ROLE_ID`    | _(unset)_       | Role mentioned in the 15-minute reminder                              |
 | `VOICE_CHANNEL_ID`    | _(unset)_       | Voice channel whose status is set to the match title at kickoff       |
+| `DAY_UTC_OFFSET`      | `0`             | Hours from UTC used to decide "today"/"tomorrow" for `^today`/`^tomorrow` |
 | `WORLDCUP_FILE`       | `worldcup.json` | Path to the schedule file                                             |

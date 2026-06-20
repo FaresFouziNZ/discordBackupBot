@@ -123,6 +123,9 @@ async def on_message(message):
     elif message.content.startswith('^tomorrow') or message.content.startswith('^tmw'):
         await send_day_matches(message.channel, 1, 'tomorrow')
         return
+    elif message.content.startswith('^results'):   # must precede ^result
+        await send_results(message.channel)
+        return
     elif message.content.startswith('^result'):
         await result_text_command(message)
         return
@@ -140,6 +143,9 @@ async def on_message(message):
         return
     elif message.content.startswith('^qualified'):
         await send_qualified(message.channel)
+        return
+    elif message.content.startswith('^thirds'):
+        await send_thirds(message.channel)
         return
     elif message.content.startswith('^bracket'):
         await send_bracket(message.channel)
@@ -264,6 +270,16 @@ async def slash_standings(interaction: discord.Interaction, group: str = ""):
 @tree.command(name="qualified", description="Qualified teams and best third-placed")
 async def slash_qualified(interaction: discord.Interaction):
     await send_qualified(Responder(interaction))
+
+
+@tree.command(name="thirds", description="Best third-placed race — the top 8 of 12 advance")
+async def slash_thirds(interaction: discord.Interaction):
+    await send_thirds(Responder(interaction))
+
+
+@tree.command(name="results", description="All recorded match results")
+async def slash_results(interaction: discord.Interaction):
+    await send_results(Responder(interaction))
 
 
 @tree.command(name="bracket", description="Knockout bracket with resolved teams")
@@ -1017,6 +1033,67 @@ async def send_qualified(channel):
     await channel.send("\n".join(lines))
 
 
+async def send_thirds(channel):
+    """The race for the 8 best third-placed spots, ranked live across groups.
+
+    Shows each group's current 3rd-placed team; the top 8 (by points, goal
+    difference, goals for) are in qualifying position. Marked provisional until
+    every group has finished."""
+    results = load_results()
+    ranked, pending = [], []
+    for g in sorted(GROUPS):
+        if not any(str(m['mid']) in results for m in GROUPS[g]):
+            pending.append(g)                 # not started — 3rd place undefined
+            continue
+        rows = group_standings(g, results)
+        if len(rows) >= 3:
+            ranked.append({**rows[2], 'group': g, 'final': group_complete(g, results)})
+    ranked.sort(key=lambda r: (-r['pts'], -r['gd'], -r['gf'], r['team']))
+
+    if not ranked:
+        await channel.send("🥉 No group results yet — the third-placed race hasn't started.")
+        return
+
+    all_final = not pending and all(group_complete(g, results) for g in GROUPS)
+    header = "🥉 **Best third-placed race** — the top 8 of 12 advance"
+    if not all_final:
+        header += "  _(provisional)_"
+    lines = [header]
+    for i, r in enumerate(ranked, start=1):
+        mark = "✅" if i <= 8 else "❌"
+        flag = "" if r['final'] else " ⏳"
+        lines.append(f"{mark} `{i:>2}` {team_label(r['team'])} — Grp {r['group']} · "
+                     f"{r['pts']} pts · GD {r['gd']:+d} · GF {r['gf']}{flag}")
+    if pending:
+        lines.append("\n⚪ Not started: " + ", ".join(f"Grp {g}" for g in pending))
+    if not all_final:
+        lines.append("_⏳ = group still in progress; standings can still change._")
+    await send_lines(channel, lines)
+
+
+async def send_results(channel):
+    """List every recorded match result, in kickoff order."""
+    results = load_results()
+    recorded = [(k, m) for k, m in sorted(MATCHES, key=lambda x: x[0])
+                if str(m['mid']) in results]
+    if not recorded:
+        await channel.send("No results recorded yet.")
+        return
+    lines = [f"📋 **Recorded results** ({len(recorded)})"]
+    for _, match in recorded:
+        res = results[str(match['mid'])]
+        t1 = resolve_token(match.get('team1'), results) or match.get('team1')
+        t2 = resolve_token(match.get('team2'), results) or match.get('team2')
+        pen = ""
+        if res.get('pen'):
+            pen = f" _(pens {'home' if res['pen'] == 1 else 'away'})_"
+        context = match.get('group') or match.get('round', '')
+        suffix = f" · {context}" if context else ""
+        lines.append(f"`#{match['mid']:>3}` {team_label(t1)} **{res['s1']}–{res['s2']}** "
+                     f"{team_label(t2)}{pen}{suffix}")
+    await send_lines(channel, lines)
+
+
 async def send_bracket(channel):
     results = load_results()
     knockout = sorted(
@@ -1443,6 +1520,8 @@ async def send_help(channel):
         "`/group [letter]` · `^group …` — fixtures + standings per group\n"
         "`/standings [group]` · `^standings …` — group tables\n"
         "`/qualified` · `^qualified` — winners/runners-up and best third-placed\n"
+        "`/thirds` · `^thirds` — best third-placed race (top 8 of 12 advance)\n"
+        "`/results` · `^results` — all recorded results\n"
         "`/bracket` · `^bracket` — knockout bracket with resolved teams\n"
         "**Predictions**\n"
         "`/predict <id> <home> <away>` · `^predict …` — predict before kickoff\n"
