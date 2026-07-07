@@ -1,11 +1,18 @@
 import discord
 from discord import app_commands
 from discord.ext import tasks
+import io
 import json
 import os
 import re
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
 
 # Load environment variables
 load_dotenv()
@@ -1094,8 +1101,214 @@ async def send_results(channel):
     await send_lines(channel, lines)
 
 
+# ---------------------------------------------------------------------------
+# Bracket image generator (Pillow)
+# ---------------------------------------------------------------------------
+# Bracket slot order – match `num` values, top→bottom per visual column.
+# Encodes the bracket structure from worldcup.json W-tokens.
+_BL_R32 = [74, 77, 73, 75, 83, 84, 81, 82]   # left  R32 → feeds R16 89,90,93,94
+_BL_R16 = [89, 90, 93, 94]                     # left  R16 → feeds QF 97,98
+_BL_QF  = [97, 98]                              # left  QF  → feeds SF 101
+_BR_R32 = [76, 78, 79, 80, 86, 88, 85, 87]   # right R32 → feeds R16 91,92,95,96
+_BR_R16 = [91, 92, 95, 96]                     # right R16 → feeds QF 99,100
+_BR_QF  = [99, 100]                             # right QF  → feeds SF 102
+
+
+def _bfont(size, bold=False):
+    suffix = '-Bold' if bold else ''
+    for p in [
+        f'/usr/share/fonts/truetype/dejavu/DejaVuSans{suffix}.ttf',
+        f'/usr/share/fonts/dejavu/DejaVuSans{suffix}.ttf',
+        f'C:/Windows/Fonts/{"arialbd" if bold else "arial"}.ttf',
+    ]:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _rname(token, results):
+    """Resolve a bracket token to a display name (≤18 chars) or 'TBD'."""
+    name = resolve_token(token, results)
+    if name is None or re.match(r'^(W|L)\d+$', name) or re.match(r'^\d[A-Z]', name):
+        return 'TBD'
+    return name[:18]
+
+
+def generate_bracket_image(results):
+    """Render the full knockout bracket as a PNG; returns BytesIO or None."""
+    if not _PIL_OK:
+        return None
+
+    # Layout
+    BOX_W, BOX_H, ROW_H = 170, 48, 24
+    STEP, GAP = 200, 30
+    HEADER, PAD_T, S = 28, 6, 68
+    IMG_W, IMG_H = 1790, 585
+
+    cx = [10 + i * STEP for i in range(9)]   # column left-edge x positions
+
+    rc = [HEADER + PAD_T + ROW_H + i * S for i in range(8)]       # R32 y-centers
+    lc = [(rc[2*i]+rc[2*i+1])/2         for i in range(4)]        # R16 y-centers
+    qc = [(lc[2*i]+lc[2*i+1])/2         for i in range(2)]        # QF  y-centers
+    sc = (qc[0] + qc[1]) / 2                                       # SF / Final y
+    tc = sc + BOX_H + 28                                            # 3rd-place y
+
+    # Colors
+    BG   = (30,  31,  46)
+    BDEF = (44,  47,  61)
+    BWIN = (29,  79,  55)
+    BLOS = (35,  36,  50)
+    CBOR = (72,  77, 110)
+    CCON = (55,  60,  95)
+    CHDR = (100, 105, 140)
+    CTEA = (215, 218, 235)
+    CTBD = (88,  92,  120)
+    CSCO = (255, 255, 255)
+    CGOL = (240, 185,  30)
+
+    img = Image.new('RGB', (IMG_W, IMG_H), BG)
+    d   = ImageDraw.Draw(img)
+
+    ft = _bfont(11);  fb = _bfont(11, bold=True)
+    fs = _bfont(12, bold=True);  fh = _bfont(10, bold=True);  fm = _bfont(9)
+
+    def tw(text, font):
+        try:
+            return font.getlength(text)
+        except Exception:
+            return len(text) * 7
+
+    # Round headers
+    for col, label in [
+        (0,'Round of 32'),(1,'Round of 16'),(2,'Quarter-final'),
+        (3,'Semi-final'), (4,'Final'),       (5,'Semi-final'),
+        (6,'Quarter-final'),(7,'Round of 16'),(8,'Round of 32'),
+    ]:
+        lw = tw(label, fh)
+        d.text((cx[col] + (BOX_W - lw) / 2, 7), label, fill=CHDR, font=fh)
+
+    # Connector helpers (draw connectors before boxes so boxes render on top)
+    def conn_left(csrc, cdst, y_top, y_bot, y_dst):
+        mx = cx[csrc] + BOX_W + GAP / 2
+        d.line([(cx[csrc]+BOX_W, int(y_top)), (int(mx), int(y_top))], fill=CCON, width=2)
+        d.line([(cx[csrc]+BOX_W, int(y_bot)), (int(mx), int(y_bot))], fill=CCON, width=2)
+        d.line([(int(mx), int(y_top)), (int(mx), int(y_bot))],        fill=CCON, width=2)
+        d.line([(int(mx), int(y_dst)), (cx[cdst], int(y_dst))],       fill=CCON, width=2)
+
+    def conn_right(csrc, cdst, y_top, y_bot, y_dst):
+        mx = cx[csrc] - GAP / 2
+        d.line([(cx[csrc],     int(y_top)), (int(mx), int(y_top))],      fill=CCON, width=2)
+        d.line([(cx[csrc],     int(y_bot)), (int(mx), int(y_bot))],      fill=CCON, width=2)
+        d.line([(int(mx), int(y_top)), (int(mx), int(y_bot))],           fill=CCON, width=2)
+        d.line([(int(mx), int(y_dst)), (cx[cdst]+BOX_W, int(y_dst))],   fill=CCON, width=2)
+
+    # All connectors first
+    for i in range(4):
+        conn_left(0, 1, rc[2*i], rc[2*i+1], lc[i])
+    for i in range(2):
+        conn_left(1, 2, lc[2*i], lc[2*i+1], qc[i])
+    conn_left(2, 3, qc[0], qc[1], sc)
+    d.line([(cx[3]+BOX_W, int(sc)), (cx[4], int(sc))],       fill=CCON, width=2)
+
+    for i in range(4):
+        conn_right(8, 7, rc[2*i], rc[2*i+1], lc[i])
+    for i in range(2):
+        conn_right(7, 6, lc[2*i], lc[2*i+1], qc[i])
+    conn_right(6, 5, qc[0], qc[1], sc)
+    d.line([(cx[4]+BOX_W, int(sc)), (cx[5], int(sc))],       fill=CCON, width=2)
+
+    # Box drawing helper
+    def draw_box(col, ctr_y, match, gold=False):
+        bx = cx[col]
+        by = int(ctr_y) - ROW_H
+        res  = results.get(str(match['mid'])) if match else None
+        t1r  = (match.get('team1') or '') if match else ''
+        t2r  = (match.get('team2') or '') if match else ''
+        t1   = _rname(t1r, results)
+        t2   = _rname(t2r, results)
+
+        winner = None
+        if res and t1 != 'TBD' and t2 != 'TBD':
+            s1, s2 = res['s1'], res['s2']
+            if   s1 > s2: winner = 1
+            elif s2 > s1: winner = 2
+            else:
+                p = res.get('pen')
+                if p == 1: winner = 1
+                elif p == 2: winner = 2
+
+        bdr = CGOL if gold else CBOR
+        bg1 = BWIN if winner == 1 else (BLOS if winner == 2 else BDEF)
+        bg2 = BWIN if winner == 2 else (BLOS if winner == 1 else BDEF)
+        d.rectangle([bx, by,        bx+BOX_W, by+ROW_H], fill=bg1, outline=bdr)
+        d.rectangle([bx, by+ROW_H,  bx+BOX_W, by+BOX_H], fill=bg2, outline=bdr)
+
+        id_w = 3
+        if match:
+            mid_lbl = f'#{match["mid"]}'
+            d.text((bx+3, by+3), mid_lbl, fill=CHDR, font=fm)
+            id_w = tw(mid_lbl, fm) + 4
+
+        if res:
+            for ri, sv in enumerate([res['s1'], res['s2']]):
+                st = str(sv)
+                sw = tw(st, fs)
+                d.text((bx+BOX_W-sw-4, by+ri*ROW_H+ROW_H//2-7), st, fill=CSCO, font=fs)
+            name_max = bx + BOX_W - tw(str(max(res['s1'], res['s2'])), fs) - 9
+        else:
+            name_max = bx + BOX_W - 4
+
+        for ri, (name, is_win) in enumerate([(t1, winner == 1), (t2, winner == 2)]):
+            fc   = CTBD if name == 'TBD' else CTEA
+            fn   = fb if is_win else ft
+            avail = name_max - (bx + id_w + 3)
+            clip  = name
+            while tw(clip, fn) > avail and len(clip) > 2:
+                clip = clip[:-1]
+            if clip != name:
+                clip = clip[:-1] + '…'
+            d.text((bx+id_w+3, by+ri*ROW_H+ROW_H//2-6), clip, fill=fc, font=fn)
+
+    # All boxes (drawn on top of connectors)
+    for i, num in enumerate(_BL_R32): draw_box(0, rc[i], MATCHES_BY_NUM.get(num))
+    for i, num in enumerate(_BL_R16): draw_box(1, lc[i], MATCHES_BY_NUM.get(num))
+    for i, num in enumerate(_BL_QF):  draw_box(2, qc[i], MATCHES_BY_NUM.get(num))
+    draw_box(3, sc, MATCHES_BY_NUM.get(101))
+
+    for i, num in enumerate(_BR_R32): draw_box(8, rc[i], MATCHES_BY_NUM.get(num))
+    for i, num in enumerate(_BR_R16): draw_box(7, lc[i], MATCHES_BY_NUM.get(num))
+    for i, num in enumerate(_BR_QF):  draw_box(6, qc[i], MATCHES_BY_NUM.get(num))
+    draw_box(5, sc, MATCHES_BY_NUM.get(102))
+
+    final_m = next((m for m in MATCHES_BY_MID.values() if m.get('round') == 'Final'), None)
+    draw_box(4, sc, final_m, gold=True)
+
+    third_m = next((m for m in MATCHES_BY_MID.values()
+                    if 'third' in (m.get('round') or '').lower()), None)
+    if third_m:
+        lbl = '3rd Place'
+        d.text((cx[4] + (BOX_W - tw(lbl, fh)) / 2, int(tc)-ROW_H-13),
+               lbl, fill=CGOL, font=fh)
+        draw_box(4, tc, third_m)
+
+    buf = io.BytesIO()
+    img.save(buf, format='PNG', optimize=True)
+    buf.seek(0)
+    return buf
+
+
 async def send_bracket(channel):
     results = load_results()
+
+    if _PIL_OK:
+        buf = generate_bracket_image(results)
+        if buf:
+            await channel.send(file=discord.File(buf, filename='bracket.png'))
+            return
+
+    # Fallback: text bracket
     knockout = sorted(
         (m for m in MATCHES_BY_MID.values() if not m.get('group')),
         key=lambda m: (m.get('num', 0), m['mid']))

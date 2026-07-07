@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     libasound2-dev \
     build-essential \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 
