@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import tasks
+import aiohttp
 import io
 import json
 import os
@@ -1747,6 +1748,466 @@ async def send_help(channel):
         "_…or tap the 📝 **Record result** button on the post-match reminder._\n"
         "`/backup` · `^backup` — download a predictions + results backup\n"
         "`/upload <file>` · `^upload` (with attachment) — restore predictions from a backup")
+
+
+# ===========================================================================
+# Esports tournament tracking — VCT Champions 2026 / OW World Cup 2026
+# ===========================================================================
+
+_ES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'esports')
+os.makedirs(_ES_DIR, exist_ok=True)
+
+ES_CONF = {
+    'vct': {
+        'name':     'VCT Champions 2026',
+        'lp_game':  'valorant',
+        'lp_page':  'VCT_Champions/2026',
+        'data':     os.path.join(_ES_DIR, 'vct_data.json'),
+        'results':  os.path.join(_ES_DIR, 'vct_results.json'),
+        'preds':    os.path.join(_ES_DIR, 'vct_preds.json'),
+        'state':    os.path.join(_ES_DIR, 'vct_state.json'),
+    },
+    'owwc': {
+        'name':     'Overwatch World Cup 2026',
+        'lp_game':  'overwatch',
+        'lp_page':  'Overwatch_World_Cup/2026',
+        'data':     os.path.join(_ES_DIR, 'owwc_data.json'),
+        'results':  os.path.join(_ES_DIR, 'owwc_results.json'),
+        'preds':    os.path.join(_ES_DIR, 'owwc_preds.json'),
+        'state':    os.path.join(_ES_DIR, 'owwc_state.json'),
+    },
+}
+
+_LP_UA       = 'DiscordBot/1.0 (personal Discord bot; contact via Discord)'
+_ES_TTL      = timedelta(hours=2)
+_es_last_fetch: dict = {}   # key -> datetime
+
+
+# ── Data I/O ──────────────────────────────────────────────────────────────
+
+def _es_load(key, what):
+    path = ES_CONF[key][what]
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {} if what in ('results', 'preds', 'state') else {'matches': [], 'last_updated': None}
+
+
+def _es_save(key, what, data):
+    path = ES_CONF[key][what]
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+# ── Liquipedia API ────────────────────────────────────────────────────────
+
+def _parse_lp_matches(raw):
+    """Convert Liquipedia cargoquery rows to our match format."""
+    rows = raw.get('cargoquery', [])
+    matches = []
+    for i, row in enumerate(rows, start=1):
+        f   = row.get('title', {})
+        t1  = (f.get('Team1') or 'TBD').strip()
+        t2  = (f.get('Team2') or 'TBD').strip()
+        bo  = str(f.get('BestOf') or '1')
+        sec = (f.get('Section') or 'Group Stage').strip()
+        grp = (f.get('GroupName') or '').strip()
+        dt_raw = f.get('DateTime UTC') or ''
+        try:
+            dt      = datetime.strptime(dt_raw, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            date_s  = dt.strftime('%Y-%m-%d')
+            time_s  = dt.strftime('%H:%M UTC+0')
+        except (ValueError, AttributeError):
+            date_s = ''; time_s = '00:00 UTC+0'
+
+        matches.append({
+            'mid':    i,
+            'num':    i,
+            'round':  sec,
+            'group':  grp or (sec if 'group' in sec.lower() else ''),
+            'date':   date_s,
+            'time':   time_s,
+            'team1':  t1 or 'TBD',
+            'team2':  t2 or 'TBD',
+            'format': f'BO{bo}',
+            'bo':     int(bo) if bo.isdigit() else 1,
+        })
+    return matches
+
+
+async def _lp_fetch(key):
+    """Fetch match schedule from Liquipedia cargo API. Returns list or None."""
+    cfg = ES_CONF[key]
+    url = f'https://liquipedia.net/{cfg["lp_game"]}/api.php'
+    params = {
+        'action':  'cargoquery',
+        'tables':  'MatchSchedule',
+        'fields':  'DateTime_UTC,Team1,Team2,BestOf,Section,GroupName',
+        'where':   f'OverallPage="{cfg["lp_page"]}"',
+        'limit':   '500',
+        'format':  'json',
+        'orderby': 'DateTime_UTC ASC',
+    }
+    headers = {'User-Agent': _LP_UA, 'Accept-Encoding': 'gzip'}
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, params=params, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 200:
+                    return _parse_lp_matches(await resp.json(content_type=None))
+                print(f'Liquipedia {key}: HTTP {resp.status}')
+    except Exception as exc:
+        print(f'Liquipedia {key} fetch error: {exc}')
+    return None
+
+
+async def es_refresh(key, force=False):
+    """Pull fresh data from Liquipedia. Returns (match_count | None, status_msg)."""
+    now  = datetime.now(timezone.utc)
+    last = _es_last_fetch.get(key)
+    if not force and last and (now - last) < _ES_TTL:
+        return None, f'Cache still fresh (last updated {discord_timestamp(last, "R")}).'
+
+    matches = await _lp_fetch(key)
+    if matches is None:
+        return None, ('❌ Liquipedia fetch failed — the API may be rate-limited or the '
+                      'tournament page does not exist yet.')
+
+    _es_save(key, 'data', {'matches': matches, 'last_updated': now.isoformat()})
+    _es_last_fetch[key] = now
+    return len(matches), f'✅ Fetched **{len(matches)}** matches from Liquipedia.'
+
+
+# ── Match helpers ──────────────────────────────────────────────────────────
+
+def _es_kickoff(match):
+    try:
+        clock, tz_part = match['time'].split()
+        h, mn = map(int, clock.split(':'))
+        off   = int(tz_part.upper().replace('UTC', '').replace('GMT', '') or 0)
+        y, mo, d = map(int, match['date'].split('-'))
+        return datetime(y, mo, d, h, mn,
+                        tzinfo=timezone(timedelta(hours=off))).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _es_line(match, results):
+    """Single-line match display with Discord timestamps."""
+    t1  = match['team1'];  t2 = match['team2']
+    res = results.get(str(match['mid']))
+    ko  = _es_kickoff(match)
+    fmt = match.get('format', 'BO3')
+    num = f"`#{match['mid']:>3}`"
+
+    if res:
+        s1, s2   = res['s1'], res['s2']
+        t1_d     = f"**{t1}**" if s1 > s2 else t1
+        t2_d     = f"**{t2}**" if s2 > s1 else t2
+        return f"{num} {t1_d} **{s1}–{s2}** {t2_d} · {fmt}"
+    else:
+        ts  = f"**{discord_timestamp(ko)}**" if ko else match.get('date', '?')
+        rel = f" ({discord_timestamp(ko, 'R')})" if ko else ''
+        return f"{num} {ts}{rel} — {t1} vs {t2} · {fmt}"
+
+
+def _es_valid_score(score1, score2, bo):
+    """Return True if score1-score2 is a legal result for a BON series."""
+    target = (bo + 1) // 2
+    return (score1 >= 0 and score2 >= 0
+            and score1 <= target and score2 <= target
+            and (score1 == target) != (score2 == target))   # exactly one reaches target
+
+
+# ── Standings ──────────────────────────────────────────────────────────────
+
+def _es_standings(matches, results):
+    groups = {}
+    for m in matches:
+        g  = m.get('group') or m.get('round') or 'Group Stage'
+        if 'playoff' in g.lower() or 'bracket' in g.lower():
+            continue
+        t1, t2 = m['team1'], m['team2']
+        if t1 == 'TBD' or t2 == 'TBD':
+            continue
+        for t in (t1, t2):
+            groups.setdefault(g, {}).setdefault(t, {'w': 0, 'l': 0, 'mw': 0, 'ml': 0})
+        res = results.get(str(m['mid']))
+        if not res:
+            continue
+        s1, s2 = res['s1'], res['s2']
+        if s1 > s2:
+            groups[g][t1]['w'] += 1; groups[g][t2]['l'] += 1
+        else:
+            groups[g][t2]['w'] += 1; groups[g][t1]['l'] += 1
+        groups[g][t1]['mw'] += s1; groups[g][t1]['ml'] += s2
+        groups[g][t2]['mw'] += s2; groups[g][t2]['ml'] += s1
+    return groups
+
+
+# ── Predictions ────────────────────────────────────────────────────────────
+
+def _es_score_pred(pred, res):
+    if pred['s1'] == res['s1'] and pred['s2'] == res['s2']:
+        return POINTS_EXACT     # 5 — exact map score
+    pw = pred['s1'] > pred['s2']
+    rw = res['s1']  > res['s2']
+    return POINTS_RESULT if pw == rw else 0   # 2 — correct winner, 0 — wrong
+
+
+def _es_leaderboard(preds, results):
+    totals: dict = {}
+    for mid_s, users in preds.items():
+        res = results.get(mid_s)
+        if not res:
+            continue
+        for uid, p in users.items():
+            totals[uid] = totals.get(uid, 0) + _es_score_pred(p, res)
+    return sorted(totals.items(), key=lambda x: x[1], reverse=True)
+
+
+# ── Shared command handlers ────────────────────────────────────────────────
+
+async def _es_matches(inter, key, count):
+    data    = _es_load(key, 'data');  results = _es_load(key, 'results')
+    matches = data.get('matches', []);  name = ES_CONF[key]['name']
+    now     = datetime.now(timezone.utc)
+
+    upcoming = sorted(
+        [(m, k) for m in matches if (k := _es_kickoff(m)) and k > now],
+        key=lambda x: x[1])
+
+    if not upcoming:
+        slug = 'vct' if key == 'vct' else 'owwc'
+        hint = f' Use `/{slug} refresh` to fetch the schedule from Liquipedia.' if not matches else ''
+        await inter.response.send_message(
+            f'**{name}** — no upcoming matches.{hint}', ephemeral=True)
+        return
+
+    lines = [f'**{name} — Next {min(count, len(upcoming))} matches**']
+    for m, _ in upcoming[:count]:
+        lines.append(_es_line(m, results))
+    if data.get('last_updated'):
+        lu = datetime.fromisoformat(data['last_updated'])
+        lines.append(f'-# Updated {discord_timestamp(lu, "R")}')
+    await inter.response.send_message('\n'.join(lines))
+
+
+async def _es_results(inter, key, count):
+    data    = _es_load(key, 'data');  results = _es_load(key, 'results')
+    matches = data.get('matches', []);  name = ES_CONF[key]['name']
+    played  = [m for m in matches if str(m['mid']) in results]
+    if not played:
+        await inter.response.send_message(f'**{name}** — no results recorded yet.', ephemeral=True)
+        return
+    lines = [f'**{name} — Results**']
+    for m in played[-count:]:
+        lines.append(_es_line(m, results))
+    await inter.response.send_message('\n'.join(lines))
+
+
+async def _es_standings_cmd(inter, key):
+    data    = _es_load(key, 'data');  results = _es_load(key, 'results')
+    matches = data.get('matches', []);  name = ES_CONF[key]['name']
+    st = _es_standings(matches, results)
+    if not st:
+        await inter.response.send_message(
+            f'**{name}** — standings not available yet.', ephemeral=True)
+        return
+    lines = [f'**{name} — Standings**']
+    for grp, teams in sorted(st.items()):
+        rows = sorted(teams.items(), key=lambda x: (-x[1]['w'], -(x[1]['mw'] - x[1]['ml'])))
+        lines.append(f'\n**{grp}**\n```')
+        lines.append(f"{'#':<3} {'Team':<22} {'W':>2} {'L':>2}  {'Maps'}")
+        lines.append('─' * 38)
+        for rank, (team, s) in enumerate(rows, 1):
+            lines.append(f"{rank:<3} {team:<22} {s['w']:>2} {s['l']:>2}  {s['mw']}–{s['ml']}")
+        lines.append('```')
+    await inter.response.send_message('\n'.join(lines))
+
+
+async def _es_predict(inter, key, match_id, score1, score2):
+    data  = _es_load(key, 'data');   name = ES_CONF[key]['name']
+    match = next((m for m in data.get('matches', []) if m['mid'] == match_id), None)
+    if not match:
+        await inter.response.send_message(f'Match #{match_id} not found in {name}.', ephemeral=True)
+        return
+
+    bo = match.get('bo', 3)
+    if not _es_valid_score(score1, score2, bo):
+        target = (bo + 1) // 2
+        await inter.response.send_message(
+            f'Invalid score for {match["format"]}. '
+            f'One team must reach {target} map wins (e.g. {target}–0, {target}–1).', ephemeral=True)
+        return
+
+    ko = _es_kickoff(match)
+    if ko and datetime.now(timezone.utc) >= ko:
+        await inter.response.send_message('❌ Match already started — predictions locked.', ephemeral=True)
+        return
+    if str(match_id) in _es_load(key, 'results'):
+        await inter.response.send_message('❌ Result already recorded for this match.', ephemeral=True)
+        return
+
+    preds = _es_load(key, 'preds')
+    preds.setdefault(str(match_id), {})[str(inter.user.id)] = {'s1': score1, 's2': score2}
+    _es_save(key, 'preds', preds)
+    t1, t2 = match['team1'], match['team2']
+    await inter.response.send_message(
+        f'🎯 Saved: **{t1} {score1}–{score2} {t2}** for {name} match #{match_id}', ephemeral=True)
+
+
+async def _es_leaderboard_cmd(inter, key):
+    results = _es_load(key, 'results');  preds = _es_load(key, 'preds')
+    name    = ES_CONF[key]['name']
+    board   = _es_leaderboard(preds, results)
+    if not board:
+        await inter.response.send_message(f'**{name}** — no scores yet.', ephemeral=True)
+        return
+    lines = [f'**{name} — Prediction Leaderboard**', '```']
+    guild = inter.guild
+    for rank, (uid, pts) in enumerate(board[:20], 1):
+        try:
+            m = guild.get_member(int(uid)) if guild else None
+            uname = m.name if m else f'user:{uid}'
+        except Exception:
+            uname = f'user:{uid}'
+        lines.append(f'{rank:>2}. {uname:<22} {pts:>4} pts')
+    lines.append('```')
+    await inter.response.send_message('\n'.join(lines))
+
+
+async def _es_result(inter, key, match_id, score1, score2):
+    if not is_result_admin(inter.user):
+        await inter.response.send_message('❌ No permission.', ephemeral=True)
+        return
+    data  = _es_load(key, 'data');  name = ES_CONF[key]['name']
+    match = next((m for m in data.get('matches', []) if m['mid'] == match_id), None)
+    if not match:
+        await inter.response.send_message(f'Match #{match_id} not found in {name}.', ephemeral=True)
+        return
+
+    bo = match.get('bo', 3)
+    if not _es_valid_score(score1, score2, bo):
+        target = (bo + 1) // 2
+        await inter.response.send_message(
+            f'Invalid score for {match["format"]}. One team must reach {target} wins.', ephemeral=True)
+        return
+
+    results = _es_load(key, 'results')
+    results[str(match_id)] = {'s1': score1, 's2': score2}
+    _es_save(key, 'results', results)
+
+    t1, t2  = match['team1'], match['team2']
+    winner  = t1 if score1 > score2 else t2
+    lines   = [f'✅ **{name}** — **{t1} {score1}–{score2} {t2}** · Winner: **{winner}**']
+
+    preds = _es_load(key, 'preds').get(str(match_id), {})
+    res   = results[str(match_id)]
+    exact, correct = [], []
+    for uid, pred in preds.items():
+        pts = _es_score_pred(pred, res)
+        mention = f'<@{uid}>'
+        if pts == POINTS_EXACT:
+            exact.append(mention)
+        elif pts == POINTS_RESULT:
+            correct.append(mention)
+    if exact:
+        lines.append(f'🎯 Exact score: {", ".join(exact)}')
+    if correct:
+        lines.append(f'✅ Correct winner: {", ".join(correct)}')
+
+    await inter.response.send_message('\n'.join(lines))
+
+
+async def _es_refresh_cmd(inter, key):
+    if not is_result_admin(inter.user):
+        await inter.response.send_message('❌ No permission.', ephemeral=True)
+        return
+    await inter.response.defer()
+    count, msg = await es_refresh(key, force=True)
+    name = ES_CONF[key]['name']
+    suffix = f' ({count} matches)' if count else ''
+    await inter.followup.send(f'**{name}** — {msg}{suffix}')
+
+
+# ── /vct commands ─────────────────────────────────────────────────────────
+
+vct_grp = app_commands.Group(name='vct', description='VCT Champions 2026')
+
+@vct_grp.command(name='matches',     description='Upcoming VCT Champions 2026 matches')
+@app_commands.describe(count='How many to show (default 8)')
+async def _vct_matches(i: discord.Interaction, count: int = 8):
+    await _es_matches(i, 'vct', count)
+
+@vct_grp.command(name='results',     description='Recent VCT Champions 2026 results')
+@app_commands.describe(count='How many to show (default 8)')
+async def _vct_results(i: discord.Interaction, count: int = 8):
+    await _es_results(i, 'vct', count)
+
+@vct_grp.command(name='standings',   description='VCT Champions 2026 group standings')
+async def _vct_standings(i: discord.Interaction):
+    await _es_standings_cmd(i, 'vct')
+
+@vct_grp.command(name='predict',     description='Predict the map score of a VCT match')
+@app_commands.describe(match_id='Match ID (from /vct matches)', score1='Maps won by team 1', score2='Maps won by team 2')
+async def _vct_predict(i: discord.Interaction, match_id: int, score1: int, score2: int):
+    await _es_predict(i, 'vct', match_id, score1, score2)
+
+@vct_grp.command(name='leaderboard', description='VCT Champions 2026 prediction leaderboard')
+async def _vct_lb(i: discord.Interaction):
+    await _es_leaderboard_cmd(i, 'vct')
+
+@vct_grp.command(name='result',      description='[Admin] Record a VCT match result')
+@app_commands.describe(match_id='Match ID', score1='Maps won by team 1', score2='Maps won by team 2')
+async def _vct_result(i: discord.Interaction, match_id: int, score1: int, score2: int):
+    await _es_result(i, 'vct', match_id, score1, score2)
+
+@vct_grp.command(name='refresh',     description='[Admin] Refresh VCT schedule from Liquipedia')
+async def _vct_refresh(i: discord.Interaction):
+    await _es_refresh_cmd(i, 'vct')
+
+tree.add_command(vct_grp)
+
+
+# ── /owwc commands ────────────────────────────────────────────────────────
+
+owwc_grp = app_commands.Group(name='owwc', description='Overwatch World Cup 2026')
+
+@owwc_grp.command(name='matches',     description='Upcoming Overwatch World Cup 2026 matches')
+@app_commands.describe(count='How many to show (default 8)')
+async def _owwc_matches(i: discord.Interaction, count: int = 8):
+    await _es_matches(i, 'owwc', count)
+
+@owwc_grp.command(name='results',     description='Recent OWWC 2026 results')
+@app_commands.describe(count='How many to show (default 8)')
+async def _owwc_results(i: discord.Interaction, count: int = 8):
+    await _es_results(i, 'owwc', count)
+
+@owwc_grp.command(name='standings',   description='OWWC 2026 group standings')
+async def _owwc_standings(i: discord.Interaction):
+    await _es_standings_cmd(i, 'owwc')
+
+@owwc_grp.command(name='predict',     description='Predict the map score of an OWWC match')
+@app_commands.describe(match_id='Match ID (from /owwc matches)', score1='Maps won by team 1', score2='Maps won by team 2')
+async def _owwc_predict(i: discord.Interaction, match_id: int, score1: int, score2: int):
+    await _es_predict(i, 'owwc', match_id, score1, score2)
+
+@owwc_grp.command(name='leaderboard', description='OWWC 2026 prediction leaderboard')
+async def _owwc_lb(i: discord.Interaction):
+    await _es_leaderboard_cmd(i, 'owwc')
+
+@owwc_grp.command(name='result',      description='[Admin] Record an OWWC match result')
+@app_commands.describe(match_id='Match ID', score1='Maps won by team 1', score2='Maps won by team 2')
+async def _owwc_result(i: discord.Interaction, match_id: int, score1: int, score2: int):
+    await _es_result(i, 'owwc', match_id, score1, score2)
+
+@owwc_grp.command(name='refresh',     description='[Admin] Refresh OWWC schedule from Liquipedia')
+async def _owwc_refresh(i: discord.Interaction):
+    await _es_refresh_cmd(i, 'owwc')
+
+tree.add_command(owwc_grp)
 
 
 client.run(DISCORD_TOKEN)
